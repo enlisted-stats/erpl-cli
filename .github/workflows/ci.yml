@@ -54,11 +54,11 @@ jobs:
             go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/$PACKAGE/$cmd.exe" "./cmd/$cmd"
           done
 
-      # The archive is the folder a player unpacks: both programs, the readmes, the maps and the
+      # The archive is the folder a player unpacks: both programs, the readme, the license, the maps and the
       # names from the game, and the empty folders for replays and reports.
       - name: Package
         run: |
-          cp -r maps data README.md README.ru.md LICENSE "dist/$PACKAGE/"
+          cp -r maps data README.md LICENSE "dist/$PACKAGE/"
           mkdir -p "dist/$PACKAGE/replays" "dist/$PACKAGE/reports"
           cd dist
           zip -r "$PACKAGE.zip" "$PACKAGE"
