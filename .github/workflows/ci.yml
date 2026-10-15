@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build for Windows
+        run: GOOS=windows GOARCH=amd64 go build ./...
+
+  release:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PACKAGE: erpl-cli-${{ github.ref_name }}-windows-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p "dist/$PACKAGE"
+          for cmd in erpl erpl-mapgen; do
+            go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/$PACKAGE/$cmd.exe" "./cmd/$cmd"
+          done
+
+      # The archive is the folder a player unpacks: both programs, the readmes, the maps and the
+      # names from the game, and the empty folders for replays and reports.
+      - name: Package
+        run: |
+          cp -r maps data README.md README.ru.md LICENSE "dist/$PACKAGE/"
+          mkdir -p "dist/$PACKAGE/replays" "dist/$PACKAGE/reports"
+          cd dist
+          zip -r "$PACKAGE.zip" "$PACKAGE"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "dist/$PACKAGE.zip" --title "$GITHUB_REF_NAME" --generate-notes

@@ -1,0 +1,13 @@
+# Replays and reports belong to the user, only the empty folders are kept
+/replays/*
+!/replays/.gitkeep
+/reports/*
+!/reports/.gitkeep
+
+# Builds
+*.exe
+/dist/
+
+# IDE settings
+.idea/
+.vscode/
