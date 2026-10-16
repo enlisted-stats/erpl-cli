@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/enlisted-stats/erpl"
+	"github.com/enlisted-stats/erpl/battle"
 	"github.com/spf13/cobra"
 
 	"github.com/enlisted-stats/erpl-cli/internal/ui"
@@ -21,6 +23,26 @@ func infoCommand() *cobra.Command {
 				return err
 			}
 			m := r.Meta()
+			gd, err := game()
+			if err != nil {
+				return err
+			}
+			mission := m.Mission
+			if n := gd.Missions[m.Mission].Name.In("en"); n != "" {
+				mission = n + ui.Muted.Render(" ("+m.Mission+")")
+			}
+			// The winner is known only from the battle, which erpl reads for one game version.
+			winner := ui.Muted.Render("not known: the replay is of another game version")
+			if m.ExeVersion == erpl.GameVersion {
+				b, err := battle.Read(r)
+				if err != nil {
+					return fmt.Errorf("replay #%d: %w", rp.Index, err)
+				}
+				winner = ui.Muted.Render("none")
+				if b.Winner != 0 {
+					winner = ui.Team(b.Winner).Render(teamName(gd, b, b.Winner))
+				}
+			}
 
 			perTeam := map[int]int{}
 			for _, p := range m.Players {
@@ -34,9 +56,10 @@ func infoCommand() *cobra.Command {
 			w := ui.NewOut(cmd.OutOrStdout())
 			fmt.Fprintln(w, header(rp.Index, rp.Path))
 			fmt.Fprintln(w, ui.Fields(
-				[2]string{"Mission", m.Mission},
-				[2]string{"Mode", fmt.Sprintf("%s · %s · %s", m.MissionType, m.Mode, m.Difficulty)},
-				[2]string{"Campaign", m.Campaign},
+				[2]string{"Mission", mission},
+				[2]string{"Mode", fmt.Sprintf("%s · %s · %s", named(gd.Modes[m.MissionType].Name, m.MissionType), m.Mode, m.Difficulty)},
+				[2]string{"Campaign", named(gd.Campaigns[m.Campaign].Name, m.Campaign)},
+				[2]string{"Winner", winner},
 				[2]string{"Started", ui.Date(m.StartTime)},
 				[2]string{"Length", ui.Clock(m.Duration)},
 				[2]string{"Finished", finished},

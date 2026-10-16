@@ -1,0 +1,16 @@
+{
+  "game": "0.7.6.63",
+  "modes": {
+    "assault": {"name":{"en":"Assault","ru":"Штурм"}},
+    "confrontation": {"name":{"en":"Confrontation","ru":"Противостояние"}},
+    "defense": {"name":{"en":"Defense of the position","ru":"Оборона позиции"}},
+    "destruction": {"name":{"en":"Destruction","ru":"Уничтожение"}},
+    "domination": {"name":{"en":"Conquest","ru":"Захват"}},
+    "escort": {"name":{"en":"Armored train escort","ru":"Сопровождение бронепоезда"}},
+    "firefight": {"name":{"en":"Firefight","ru":"Перестрелка"}},
+    "invasion": {"name":{"en":"Invasion","ru":"Вторжение"}},
+    "practice": {"name":{"en":"Practice","ru":"Практика"}},
+    "tutorial": {"name":{"en":"Tutorial","ru":"Обучение"}},
+    "zombie_mode": {"name":{"en":"The Gates of Destiny","ru":"Врата судьбы"}}
+  }
+}

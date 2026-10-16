@@ -50,15 +50,13 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir -p "dist/$PACKAGE"
-          for cmd in erpl erpl-mapgen; do
-            go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/$PACKAGE/$cmd.exe" "./cmd/$cmd"
-          done
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/$PACKAGE/erpl.exe" ./cmd/erpl
 
-      # The archive is the folder a player unpacks: both programs, the readme, the license, the maps and the
-      # names from the game, and the empty folders for replays and reports.
+      # The archive is the folder a player unpacks: the program with the game data built in, the readme, the
+      # license and the empty folders for replays and reports.
       - name: Package
         run: |
-          cp -r maps data README.md LICENSE "dist/$PACKAGE/"
+          cp README.md LICENSE "dist/$PACKAGE/"
           mkdir -p "dist/$PACKAGE/replays" "dist/$PACKAGE/reports"
           cd dist
           zip -r "$PACKAGE.zip" "$PACKAGE"

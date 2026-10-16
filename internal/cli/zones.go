@@ -24,6 +24,10 @@ func zonesCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			gd, err := game()
+			if err != nil {
+				return err
+			}
 			zs := slices.Clone(b.Zones)
 			slices.SortStableFunc(zs, func(a, b *battle.Zone) int {
 				return cmp.Or(cmp.Compare(a.Created, b.Created), cmp.Compare(a.Title, b.Title))
@@ -31,9 +35,10 @@ func zonesCommand() *cobra.Command {
 
 			rows := make([][]string, len(zs))
 			for i, z := range zs {
+				caption := strings.TrimPrefix(z.Caption, "capzone/")
 				rows[i] = []string{
-					cmp.Or(z.Title, "-"), strings.TrimPrefix(z.Caption, "capzone/"), z.Group,
-					shape(z), active(z), owners(z.Owner),
+					cmp.Or(z.Title, "-"), named(gd.Zones[caption].Name, caption), z.Group,
+					shape(z), active(z), owners(z.Owner, func(n int) string { return teamName(gd, b, n) }),
 				}
 			}
 
@@ -81,13 +86,13 @@ func active(z *battle.Zone) string {
 	return strings.Join(spans, ", ")
 }
 
-// owners lists the owner changes as "time team", the team in its color.
-func owners(cs []battle.Change[int]) string {
+// owners lists the owner changes as "time team", the team named by name in its color.
+func owners(cs []battle.Change[int], name func(team int) string) string {
 	parts := make([]string, len(cs))
 	for i, c := range cs {
 		owner := ui.Muted.Render("none")
 		if c.Value > 0 {
-			owner = ui.Team(c.Value).Render(fmt.Sprintf("team %d", c.Value))
+			owner = ui.Team(c.Value).Render(name(c.Value))
 		}
 		parts[i] = ui.Clock(c.Time) + " " + owner
 	}

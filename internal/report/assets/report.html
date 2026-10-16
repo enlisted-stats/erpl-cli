@@ -13,13 +13,14 @@
       <h1 id="mission"></h1>
       <p id="subtitle"></p>
     </div>
-    <nav id="modes" role="tablist"></nav>
+    <div id="result"></div>
     <div id="teams"></div>
     <button id="theme" class="iconbtn"></button>
   </header>
   <main id="view">
     <canvas id="map"></canvas>
     <div id="tip" role="tooltip"></div>
+    <section id="card" hidden></section>
     <div id="scale"></div>
     <div class="zoom">
       <button id="zoomIn"></button>
@@ -27,7 +28,11 @@
       <button id="zoomFit"></button>
     </div>
   </main>
-  <aside id="panel"></aside>
+  <aside id="panel">
+    <div class="block" id="filters"></div>
+    <div class="block" id="layers"></div>
+    <div class="block grow" id="lists"></div>
+  </aside>
   <section id="strip">
     <div id="stripHead"></div>
     <canvas id="timeline"></canvas>

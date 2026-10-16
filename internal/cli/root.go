@@ -24,7 +24,7 @@ func New() *cobra.Command {
 			"Commands take the replay number shown by erpl list; without a number they use the latest replay.",
 	}
 	root.AddCommand(listCommand(), infoCommand(), playersCommand(), killsCommand(),
-		vehiclesCommand(), structuresCommand(), zonesCommand(), reportCommand())
+		vehiclesCommand(), weaponsCommand(), structuresCommand(), zonesCommand(), reportCommand())
 	return root
 }
 
@@ -73,6 +73,9 @@ func read(args []string) (replays.Replay, erpl.Meta, *battle.Battle, error) {
 	rp, r, err := open(args)
 	if err != nil {
 		return replays.Replay{}, erpl.Meta{}, nil, err
+	}
+	if v := r.Meta().ExeVersion; v != erpl.GameVersion {
+		return replays.Replay{}, erpl.Meta{}, nil, fmt.Errorf("replay #%d is of game %s, erpl reads replays of %s", rp.Index, v, erpl.GameVersion)
 	}
 	b, err := battle.Read(r)
 	if err != nil {

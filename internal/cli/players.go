@@ -12,17 +12,19 @@ import (
 	"github.com/enlisted-stats/erpl/battle"
 	"github.com/spf13/cobra"
 
+	"github.com/enlisted-stats/erpl-cli/internal/gamedata"
 	"github.com/enlisted-stats/erpl-cli/internal/ui"
 )
 
-// playerStats are the columns of the players table, as titles and Player.Stats keys.
+// playerStats are the columns of the players table after the headshots, as titles
+// and Player.Stats keys.
 var playerStats = [][2]string{
-	{"Kills", "kills"},
 	{"Deaths", "soldierDeaths"},
 	{"Tanks", "tankKills"},
 	{"Planes", "planeKills"},
 	{"Assists", "assists"},
 	{"Captures", "captures"},
+	{"Built", "builtStructures"},
 	{"Score", "score"},
 }
 
@@ -35,6 +37,16 @@ func playersCommand() *cobra.Command {
 			rp, _, b, err := read(args)
 			if err != nil {
 				return err
+			}
+			gd, err := game()
+			if err != nil {
+				return err
+			}
+			headshots := map[*battle.Player]int{}
+			for _, s := range b.Soldiers {
+				if d := s.Death; d != nil && d.Headshot && d.Killer != nil && d.Killer != s {
+					headshots[d.Killer.Player]++
+				}
 			}
 
 			teams := map[int][]*battle.Player{}
@@ -51,35 +63,44 @@ func playersCommand() *cobra.Command {
 			fmt.Fprint(w, header(rp.Index, rp.Path))
 			for _, n := range numbers {
 				fmt.Fprintln(w)
-				fmt.Fprintln(w, teamTitle(n, teams[n]))
-				fmt.Fprintln(w, playersTable(w, teams[n]))
+				fmt.Fprintln(w, teamTitle(gd, b, n, teams[n]))
+				fmt.Fprintln(w, playersTable(w, teams[n], headshots))
 			}
 			return nil
 		},
 	}
 }
 
-func teamTitle(n int, ps []*battle.Player) string {
+func teamTitle(gd *gamedata.Data, b *battle.Battle, n int, ps []*battle.Player) string {
 	title := "No team"
 	if n != 0 {
 		title = fmt.Sprintf("Team %d", n)
 	}
 	title = ui.Team(n).Bold(true).Render(title)
-	if ps[0].Army != "" {
-		title += ui.Muted.Render(" · " + ps[0].Army)
+	if n != 0 && teamArmy(b, n) != "" {
+		title += ui.Muted.Render(" · " + teamName(gd, b, n))
 	}
-	return title + ui.Muted.Render(fmt.Sprintf(" · %d players", len(ps)))
+	title += ui.Muted.Render(fmt.Sprintf(" · %d players", len(ps)))
+	switch {
+	case n == 0 || b.Winner == 0:
+	case n == b.Winner:
+		title += ui.Good.Render(" · won")
+	default:
+		title += ui.Bad.Render(" · lost")
+	}
+	return title
 }
 
-// playersTable lists the players of one team, best score first.
-func playersTable(w ui.Out, ps []*battle.Player) string {
+// playersTable lists the players of one team, best score first. headshots counts the
+// headshot kills of each player.
+func playersTable(w ui.Out, ps []*battle.Player, headshots map[*battle.Player]int) string {
 	ps = slices.Clone(ps)
 	slices.SortStableFunc(ps, func(a, b *battle.Player) int {
 		return cmp.Compare(b.Stats["score"], a.Stats["score"])
 	})
 	platoons := platoonLetters(ps)
 
-	cols := []ui.Column{{Title: "Player", Cut: true}, {Title: "Platoon"}}
+	cols := []ui.Column{{Title: "Player", Cut: true}, {Title: "Platoon"}, {Title: "Kills", Right: true}, {Title: "Headshots", Right: true}}
 	for _, s := range playerStats {
 		cols = append(cols, ui.Column{Title: s[0], Right: true})
 	}
@@ -87,7 +108,7 @@ func playersTable(w ui.Out, ps []*battle.Player) string {
 
 	rows := make([][]string, len(ps))
 	for i, p := range ps {
-		row := []string{p.Name, platoons[p.Group]}
+		row := []string{p.Name, platoons[p.Group], number(p.Stats["kills"]), strconv.Itoa(headshots[p])}
 		for _, s := range playerStats {
 			row = append(row, number(p.Stats[s[1]]))
 		}

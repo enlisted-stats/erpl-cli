@@ -28,9 +28,14 @@ func structuresCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			gd, err := game()
+			if err != nil {
+				return err
+			}
+			name := func(s *battle.Structure) string { return named(gd.Structures[s.Kind].Name, s.Kind) }
 			var ss []*battle.Structure
 			for _, s := range b.Structures {
-				if strings.Contains(s.Kind, kind) {
+				if strings.Contains(s.Kind, kind) || strings.Contains(strings.ToLower(name(s)), strings.ToLower(kind)) {
 					ss = append(ss, s)
 				}
 			}
@@ -45,20 +50,20 @@ func structuresCommand() *cobra.Command {
 			w := ui.NewOut(cmd.OutOrStdout())
 			fmt.Fprint(w, header(rp.Index, rp.Path))
 			if all {
-				fmt.Fprintln(w, structuresTable(w, ss, stood))
+				fmt.Fprintln(w, structuresTable(w, ss, name, stood))
 			} else {
-				fmt.Fprintln(w, kindsTable(w, ss, stood))
+				fmt.Fprintln(w, kindsTable(w, ss, name, func(n int) string { return teamName(gd, b, n) }, stood))
 			}
 			fmt.Fprintln(w, ui.Muted.Render(fmt.Sprintf("%d structures", len(ss))))
 			return nil
 		},
 	}
-	c.Flags().StringVarP(&kind, "kind", "k", "", "only structures whose kind contains this text, e.g. rallypoint")
+	c.Flags().StringVarP(&kind, "kind", "k", "", "only structures whose name or kind contains this text, e.g. rally")
 	c.Flags().BoolVarP(&all, "all", "a", false, "list every structure instead of counting them by kind")
 	return c
 }
 
-func structuresTable(w ui.Out, ss []*battle.Structure, stood func(*battle.Structure) time.Duration) string {
+func structuresTable(w ui.Out, ss []*battle.Structure, name func(*battle.Structure) string, stood func(*battle.Structure) time.Duration) string {
 	rows := make([][]string, len(ss))
 	for i, s := range ss {
 		removed := ui.Good.Render("stood")
@@ -66,18 +71,19 @@ func structuresTable(w ui.Out, ss []*battle.Structure, stood func(*battle.Struct
 			removed = ui.Clock(s.Removed)
 		}
 		rows[i] = []string{
-			ui.Clock(s.Built), s.Kind, ui.Team(s.Team).Render(playerName(s.Player)),
+			ui.Clock(s.Built), name(s), ui.Team(s.Team).Render(playerName(s.Player)),
 			fmt.Sprintf("%.0f, %.0f", s.Pos[0], s.Pos[2]), removed, ui.Clock(stood(s)),
 		}
 	}
 	return w.Table([]ui.Column{
-		{Title: "Built", Right: true}, {Title: "Kind", Cut: true}, {Title: "Player", Cut: true},
+		{Title: "Built", Right: true}, {Title: "Structure", Cut: true}, {Title: "Player", Cut: true},
 		{Title: "x, z", Right: true}, {Title: "Removed", Right: true}, {Title: "Stood", Right: true},
 	}, rows, nil)
 }
 
-// kindsTable counts the structures of each kind by team, most built first.
-func kindsTable(w ui.Out, ss []*battle.Structure, stood func(*battle.Structure) time.Duration) string {
+// kindsTable counts the structures of each name by team, most built first: kinds of
+// different armies share a name, e.g. "Rally point". team names the teams.
+func kindsTable(w ui.Out, ss []*battle.Structure, name func(*battle.Structure) string, team func(int) string, stood func(*battle.Structure) time.Duration) string {
 	type kind struct {
 		name    string
 		teams   [3]int
@@ -87,10 +93,11 @@ func kindsTable(w ui.Out, ss []*battle.Structure, stood func(*battle.Structure) 
 	byName := map[string]*kind{}
 	var kinds []*kind
 	for _, s := range ss {
-		k := byName[s.Kind]
+		n := name(s)
+		k := byName[n]
 		if k == nil {
-			k = &kind{name: s.Kind}
-			byName[s.Kind] = k
+			k = &kind{name: n}
+			byName[n] = k
 			kinds = append(kinds, k)
 		}
 		if s.Team == 1 || s.Team == 2 {
@@ -114,7 +121,7 @@ func kindsTable(w ui.Out, ss []*battle.Structure, stood func(*battle.Structure) 
 		}
 	}
 	return w.Table([]ui.Column{
-		{Title: "Kind", Cut: true}, {Title: "Team 1", Right: true}, {Title: "Team 2", Right: true},
+		{Title: "Structure", Cut: true}, {Title: team(1), Right: true}, {Title: team(2), Right: true},
 		{Title: "Removed", Right: true}, {Title: "Stood on average", Right: true},
 	}, rows, nil)
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"github.com/enlisted-stats/erpl/battle"
 	"github.com/spf13/cobra"
 
+	"github.com/enlisted-stats/erpl-cli/internal/gamedata"
 	"github.com/enlisted-stats/erpl-cli/internal/ui"
 )
 
@@ -23,9 +25,15 @@ func vehiclesCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "vehicles [number]",
 		Short: "Show tanks, planes and other vehicles, who called them in and how they did",
-		Args:  cobra.MaximumNArgs(1),
+		Long: "Show tanks, planes and other vehicles, who called them in and how they did.\n\n" +
+			"Guns built by engineers are listed too, with the kind gun.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			rp, m, b, err := read(args)
+			if err != nil {
+				return err
+			}
+			gd, err := game()
 			if err != nil {
 				return err
 			}
@@ -33,15 +41,21 @@ func vehiclesCommand() *cobra.Command {
 			destroyed := 0
 			rows := make([][]string, len(b.Vehicles))
 			for i, v := range b.Vehicles {
-				end, fate := v.Destroyed, ui.Clock(v.Destroyed)
-				if v.Destroyed == 0 {
-					end, fate = m.LastRecordTime, ui.Good.Render("survived")
-				} else {
+				end, fate, by, weapon := m.LastRecordTime, ui.Good.Render("survived"), "", ""
+				if d := v.Death; d != nil {
+					end, fate, by, weapon = d.Time, ui.Clock(d.Time), "-", weaponName(gd, d.Weapon)
+					if d.Killer != nil {
+						by = soldierName(d.Killer)
+					}
 					destroyed++
 				}
+				player, team := v.Player, v.Team
+				if s := v.Structure; s != nil {
+					player, team = s.Player, s.Team
+				}
 				rows[i] = []string{
-					ui.Clock(v.Spawned), ui.Model(v.Template), kindNames[v.Kind],
-					ui.Team(v.Team).Render(playerName(v.Player)), fate, ui.Clock(max(end-v.Spawned, 0)),
+					ui.Clock(v.Spawned), vehicleName(gd, v), vehicleKind(gd, v),
+					ui.Team(team).Render(playerName(player)), fate, by, weapon, ui.Clock(max(end-v.Spawned, 0)),
 					strconv.Itoa(crewSize(v)), fmt.Sprintf("%.1f", distance(v.Track)/1000),
 				}
 			}
@@ -50,9 +64,9 @@ func vehiclesCommand() *cobra.Command {
 			fmt.Fprint(w, header(rp.Index, rp.Path))
 			fmt.Fprintln(w, w.Table([]ui.Column{
 				{Title: "Spawned", Right: true}, {Title: "Vehicle", Cut: true}, {Title: "Kind"}, {Title: "Player", Cut: true},
-				{Title: "Destroyed", Right: true}, {Title: "Lived", Right: true}, {Title: "Crew", Right: true}, {Title: "km", Right: true},
+				{Title: "Destroyed", Right: true}, {Title: "By", Cut: true}, {Title: "Weapon", Cut: true}, {Title: "Lived", Right: true}, {Title: "Crew", Right: true}, {Title: "km", Right: true},
 			}, rows, func(i int) lipgloss.Style {
-				if b.Vehicles[i].Player == nil {
+				if v := b.Vehicles[i]; v.Player == nil && v.Structure == nil {
 					return ui.Muted
 				}
 				return lipgloss.NewStyle()
@@ -80,4 +94,13 @@ func distance(t battle.Track) float64 {
 		d += math.Hypot(float64(b[0]-a[0]), float64(b[2]-a[2]))
 	}
 	return d
+}
+
+// vehicleKind is the kind of a vehicle the game counts in its statistics, e.g. "tank",
+// "gun" for a gun built by an engineer, or the kind of physics for other vehicles.
+func vehicleKind(gd *gamedata.Data, v *battle.Vehicle) string {
+	if v.Structure != nil {
+		return "gun"
+	}
+	return cmp.Or(gd.Vehicles[ui.Model(v.Template)].Kind, kindNames[v.Kind])
 }

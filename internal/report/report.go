@@ -3,18 +3,14 @@ package report
 import (
 	"cmp"
 	"embed"
-	"encoding/base64"
 	"encoding/json"
 	"html/template"
 	"io"
-	"os"
-	"path/filepath"
 
 	"github.com/enlisted-stats/erpl"
 	"github.com/enlisted-stats/erpl/battle"
 
-	"github.com/enlisted-stats/erpl-cli/internal/maps"
-	"github.com/enlisted-stats/erpl-cli/internal/names"
+	"github.com/enlisted-stats/erpl-cli/internal/gamedata"
 )
 
 //go:embed assets
@@ -26,19 +22,18 @@ var page = template.Must(template.ParseFS(assets, "assets/report.html"))
 var Languages = []string{"en", "ru"}
 
 // scripts are the page scripts in the order they run.
-var scripts = []string{"icons.js", "strings.js", "app.js"}
+var scripts = []string{"icons.js", "glyphs.js", "strings.js", "app.js"}
 
 // Write renders a self-contained page about the battle in the language lang, e.g.
-// "en": the data, the map image, the styles and the script are all inside. ix and
-// mapsDir give the map; without it the page draws the battle on a grid. n gives the
-// in-game names; without them the page shows ids.
-func Write(w io.Writer, lang, file string, m erpl.Meta, b *battle.Battle, n names.Names, ix maps.Index, mapsDir string) error {
-	mission := ix.Missions[m.Mission]
-	img, err := mapImageOf(ix, mission, mapsDir)
+// "en": the data, the map image, the styles and the script are all inside. gd gives
+// the map and the in-game names. Without a map the page draws the battle on a grid,
+// without a name it shows the id.
+func Write(w io.Writer, lang, file string, m erpl.Meta, b *battle.Battle, gd *gamedata.Data) error {
+	img, err := mapImageOf(gd, m.Mission, battleBox(b, gd.Missions[m.Mission].Areas))
 	if err != nil {
 		return err
 	}
-	js, err := json.Marshal(build(lang, file, m, b, n, mission, img))
+	js, err := json.Marshal(build(lang, file, m, b, gd, img))
 	if err != nil {
 		return err
 	}
@@ -59,22 +54,5 @@ func Write(w io.Writer, lang, file string, m erpl.Meta, b *battle.Battle, n name
 		Style  template.CSS
 		Script template.JS
 		Data   template.JS
-	}{cmp.Or(n.Missions[m.Mission], m.Mission), template.CSS(style), template.JS(script), template.JS(js)})
-}
-
-// mapImageOf reads the image of the mission's map, or returns nil if the map is not known.
-func mapImageOf(ix maps.Index, mission maps.Mission, dir string) (*mapImage, error) {
-	mp, ok := ix.Maps[mission.Map]
-	if !ok || mp.Image == "" {
-		return nil, nil
-	}
-	raw, err := os.ReadFile(filepath.Join(dir, mp.Image))
-	if err != nil {
-		return nil, err
-	}
-	return &mapImage{
-		Image:       "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(raw),
-		LeftTop:     mp.LeftTop,
-		RightBottom: mp.RightBottom,
-	}, nil
+	}{cmp.Or(gd.Missions[m.Mission].Name.In(lang), m.Mission), template.CSS(style), template.JS(script), template.JS(js)})
 }

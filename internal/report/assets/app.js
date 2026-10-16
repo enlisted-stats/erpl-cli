@@ -12,14 +12,116 @@ const words = s => s.replace(/_/g, ' ');
 const capital = s => s.charAt(0).toUpperCase() + s.slice(1);
 const END = D.meta.end || D.meta.duration;
 const team = n => D.teams.find(t => t.number === n);
-const armyName = t => t.armyName || capital(words(t.army || ''));
-const teamName = n => team(n) && team(n).army ? tr('teamArmy', n, armyName(team(n))) : tr('team', n);
+const teamName = n => team(n) ? team(n).armyName || capital(words(team(n).army || '')) || tr('team', n) : tr('team', n);
 const playerName = i => i >= 0 ? D.players[i].name : tr('ai');
-// Names come from the game when erpl-mapgen found them, otherwise from ids.
-const vehicleName = v => v.name || capital(words(v.model.replace(/^(ussr|germ|ger|us|usa|uk|jp|jap|ita|it|fr|cn)_/, '')));
-const structureName = s => s.name || capital(words(s.kind.replace(/^builded_/, '')));
+// Names come from the game data when it has them, otherwise from ids.
+const vehicleName = v => v.name || capital(words(v.model.replace(/^(ussr|germ|ger|us|usa|uk|jp|jap|ita|it|fr|cn|builded)_/, '')));
+const structureName = s => s.rally ? tr('rallyPoint') : s.name || capital(words(s.kind.replace(/^builded_/, '')));
 const zoneName = z => z.label || capital(words(z.name || ''));
+const weaponName = w => w >= 0 ? D.weapons[w].name : '';
 const stat = (p, k) => num(p.stats[k]);
+
+// ---------- tracks
+// A track comes as differences dt, dx, dz with the time in tenths of a second; it is
+// turned into t, x, z, t, x, z, ... with the time in seconds.
+function decodeTrack(a) {
+  const out = new Float64Array(a.length);
+  let t = 0, x = 0, z = 0;
+  for (let i = 0; i < a.length; i += 3) {
+    t += a[i]; x += a[i + 1]; z += a[i + 2];
+    out[i] = t / 10; out[i + 1] = x; out[i + 2] = z;
+  }
+  return out;
+}
+for (const s of D.soldiers) s.track = decodeTrack(s.track);
+for (const v of D.vehicles) v.track = decodeTrack(v.track);
+
+// posAt is the last track point at or before t, or the first one when t is before it.
+function posAt(track, t) {
+  if (!track.length) return null;
+  let lo = 0, hi = track.length / 3 - 1;
+  if (track[0] > t) return [track[1], track[2]];
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (track[mid * 3] <= t) lo = mid; else hi = mid - 1;
+  }
+  return [track[lo * 3 + 1], track[lo * 3 + 2]];
+}
+// trackLength is the length of a track on the ground, in meters.
+function trackLength(track) {
+  let d = 0;
+  for (let i = 3; i < track.length; i += 3) d += Math.hypot(track[i + 1] - track[i - 2], track[i + 2] - track[i - 1]);
+  return d;
+}
+
+// ---------- events
+// GROUPS put the kinds of weapons into the groups the deaths can be filtered by.
+const GROUPS = {
+  small: ['pistol', 'submachine_gun', 'rifle', 'semiauto', 'assault_rifle', 'machine_gun', 'shotgun', 'melee'],
+  explosive: ['grenade', 'molotov', 'tnt_block', 'mine', 'launcher', 'mortar', 'flamethrower'],
+  vehicle: ['cannon', 'autocannon', 'vehicle_machine_gun', 'smoke'],
+  air: ['aircraft_gun', 'bomb', 'rocket'],
+  artillery: ['artillery'],
+};
+const GROUP_NAMES = { small: 'groupSmall', explosive: 'groupExplosive', vehicle: 'groupVehicle', air: 'groupAir', artillery: 'groupArtillery', other: 'groupOther' };
+const groupOf = w => w >= 0 && Object.keys(GROUPS).find(g => GROUPS[g].includes(D.weapons[w].kind)) || 'other';
+
+// KILLS are the deaths of soldiers and vehicles: where the victim was, who killed and
+// from where.
+const KILLS = [];
+D.soldiers.forEach((s, i) => {
+  if (!s.died) return;
+  const p = posAt(s.track, s.died);
+  if (p) KILLS.push({ t: s.died, soldier: i, team: s.team, player: s.player, by: s.killerSoldier, weapon: s.weapon, headshot: !!s.headshot, x: p[0], z: p[1] });
+});
+D.vehicles.forEach((v, i) => {
+  if (!v.destroyed) return;
+  const p = posAt(v.track, v.destroyed);
+  if (p) KILLS.push({ t: v.destroyed, vehicle: i, team: v.team, player: v.player, by: v.killerSoldier, weapon: v.weapon, headshot: false, x: p[0], z: p[1] });
+});
+for (const k of KILLS) {
+  const ks = k.by >= 0 ? D.soldiers[k.by] : null;
+  k.byPlayer = ks ? ks.player : -1;
+  k.byTeam = ks ? ks.team : 0;
+  k.group = groupOf(k.weapon);
+  const from = ks && posAt(ks.track, k.t);
+  if (from && k.by !== k.soldier) { k.fx = from[0]; k.fz = from[1]; k.dist = Math.round(Math.hypot(k.x - from[0], k.z - from[1])); }
+}
+KILLS.sort((a, b) => a.t - b.t);
+const enemyKill = k => k.by >= 0 && k.byTeam && k.byTeam !== k.team;
+
+const DOWNS = [];
+D.soldiers.forEach((s, i) => (s.downs || []).forEach(([t, by, revived]) => {
+  const p = posAt(s.track, t);
+  if (p) DOWNS.push({ t, soldier: i, team: s.team, player: s.player, by, revived, x: p[0], z: p[1] });
+}));
+
+// SPAWN_POINTS are the places squads came from: bases, rally points and APCs, each with
+// its squads. Bases and rally points nobody used are there too.
+const SPAWN_POINTS = (() => {
+  const points = new Map();
+  const point = (key, make) => { if (!points.has(key)) points.set(key, { ...make(), spawns: [] }); return points.get(key); };
+  D.bases.forEach((b, i) => point('base' + i, () => ({ from: 'base', kind: b.kind, ref: i, team: b.team, player: -1, pos: b.pos, active: b.active })));
+  D.structures.forEach((s, i) => { if (s.rally) point('rally' + i, () => ({ from: 'rally', ref: i, team: s.team, player: s.player, pos: s.pos, a: s.built, b: s.removed })); });
+  D.spawns.forEach((sp, i) => {
+    let p = null;
+    if (sp.from === 'base' || sp.from === 'rally') p = points.get(sp.from + sp.ref);
+    else if (sp.from === 'apc') {
+      const v = D.vehicles[sp.ref];
+      p = point('apc' + sp.ref, () => ({ from: 'apc', ref: sp.ref, team: v.team, player: v.player, pos: null, a: v.spawned, b: v.destroyed }));
+    }
+    if (p) p.spawns.push(i);
+  });
+  return [...points.values()];
+})();
+const spawnGlyph = p => p.from === 'base' ? (p.kind === 'infantry' ? 'flag' : 'tank') : p.from;
+const BASE_NAMES = { infantry: 'baseInfantry', vehicles: 'baseVehicles', freeTank: 'baseFreeTank' };
+const spawnPointName = p => p.from === 'rally' ? tr('rallyPoint') : p.from === 'apc' ? tr('apcRespawn', vehicleName(D.vehicles[p.ref])) : tr(BASE_NAMES[p.kind]);
+// spawnPointOpen tells whether a place squads came from was there within the chosen time.
+// A base must be open a little within the time: at the end of a sector the bases of the
+// next one open in the same second.
+const spawnPointOpen = p => p.from === 'base' ? p.active.some(([a, b]) => Math.min(b, state.t1) - Math.max(a, state.t0) > Math.min(2, (state.t1 - state.t0) / 4))
+  : p.from === 'apc' ? pointSpawns(p).length > 0 : overlaps(p.a, p.b);
 
 // ---------- theme
 // Colors come from the CSS variables of the current theme.
@@ -43,21 +145,27 @@ function applyTheme(t) {
   sprites.clear();
   $('theme').innerHTML = icon(t === 'dark' ? 'sun' : 'moon');
   $('theme').title = tr(t === 'dark' ? 'themeLight' : 'themeDark');
-  if (ready) { renderTop(); renderPanel(); }
+  if (ready) { renderTop(); renderPanel(); renderCard(); }
   draw();
 }
 
 // ---------- state
-// mode is what the map shows: infantry, vehicles or structures. team filters it; sel is
-// the vehicle or structure picked in the list or on the map.
-const state = { mode: 'fight', team: 0, t0: 0, t1: END, sel: null, hot: null, skipSpawn: true, deaths: false, planes: false, other: false, heat: false };
-const MODES = [['fight', 'flame', 'modeFight'], ['vehicles', 'car', 'modeVehicles'], ['structures', 'hammer', 'modeStructures']];
+// layers are what the map shows; groups and kinds filter the deaths and the vehicles.
+// sel is the object the card is about: {type, id} with the type player, vehicle,
+// structure, spawn (an index in SPAWN_POINTS), kill (in KILLS) or down (in DOWNS).
+const state = {
+  team: 0, t0: 0, t1: END, sel: null, hot: null, list: 'players', skipSpawn: true,
+  layers: { heat: true, deaths: false, downs: false, spawns: true, vehicles: true, structures: false },
+  groups: new Set(Object.keys(GROUP_NAMES)),
+  kinds: new Set(['tank', 'apc', 'bike', 'car', 'gun', 'ship']),
+};
 const same = (a, b) => !!(a && b && a.type === b.type && a.id === b.id);
 const ofTeam = t => !state.team || t === state.team;
 const whole = () => state.t0 <= 0 && state.t1 >= END;
+const inTime = t => t >= state.t0 && t <= state.t1;
+const overlaps = (a, b) => a <= state.t1 && (b || END) >= state.t0;
 
 // ---------- time and sectors
-const overlaps = (a, b) => a <= state.t1 && b >= state.t0;
 // zoneActive tells whether the zone was active for a while within the chosen time; zones
 // without activity data are active all the time.
 const zoneActive = z => !z.active || z.active.some(([a, b]) => a < state.t1 && b > state.t0);
@@ -66,12 +174,6 @@ function ownerAt(z, t) {
   let o;
   for (const [ct, tm] of z.owners || []) if (ct <= t) o = tm;
   return o;
-}
-// posAt returns the last track point at or before t.
-function posAt(track, t) {
-  let p = null;
-  for (let i = 0; i < track.length && track[i] <= t; i += 3) p = [track[i + 1], track[i + 2]];
-  return p;
 }
 
 // SECTORS are the stages of the battle: zones of a group are active together, and the
@@ -88,7 +190,7 @@ const SECTORS = (() => {
     const spans = zones.flatMap(z => z.active);
     const a = Math.min(...spans.map(s => s[0])), b = Math.max(...spans.map(s => s[1]));
     const before = ownerAt(zones[0], a + 0.5), after = ownerAt(zones[0], b);
-    return { group, zones, a, b, taker: after > 0 && after !== before ? after : 0, holder: before > 0 ? before : 0 };
+    return { group, zones, a, b, taker: after > 0 && after !== before ? after : 0 };
   }).sort((x, y) => x.a - y.a);
   list.forEach((s, i) => { s.n = i + 1; s.name = s.zones.map(z => z.title || zoneName(z)).join(', '); });
   return list;
@@ -106,30 +208,22 @@ function areaActive(a) {
 }
 
 // ---------- world and view
-// Map units: the map image is S x S units; without a map the fighting area is.
-const S = 1024;
-const allSoldiers = D.soldiers.map((s, i) => i);
+// The world is drawn in meters: x to the right, z to the top of the screen.
 let L, T, R, B;
 if (D.map) {
   [L, T] = D.map.leftTop;
   [R, B] = D.map.rightBottom;
 } else {
-  const b = box(allSoldiers, 0.01, 0.99);
+  const b = box(D.soldiers, 0.01, 0.99);
   const side = Math.max(b.r - b.l, b.t - b.b, 200) * 1.3, cx = (b.l + b.r) / 2, cz = (b.t + b.b) / 2;
   [L, T, R, B] = [cx - side / 2, cz + side / 2, cx + side / 2, cz - side / 2];
 }
-const mx = x => (x - L) / (R - L) * S;
-const my = z => (z - T) / (B - T) * S;
-const metersPerUnit = (R - L) / S;
-const MAX_ZOOM = 40;
+const MAX_ZOOM = 30;
 
-// box is the box around the positions of the given soldiers between two quantiles.
+// box is the box around the track points of the soldiers between two quantiles.
 function box(soldiers, qlo, qhi) {
   const xs = [], zs = [];
-  for (const i of soldiers) {
-    const tr_ = D.soldiers[i].track;
-    for (let j = 0; j < tr_.length; j += 3) { xs.push(tr_[j + 1]); zs.push(tr_[j + 2]); }
-  }
+  for (const s of soldiers) for (let j = 0; j < s.track.length; j += 3) { xs.push(s.track[j + 1]); zs.push(s.track[j + 2]); }
   if (!xs.length) return { l: -100, r: 100, t: 100, b: -100 };
   xs.sort((a, b) => a - b); zs.sort((a, b) => a - b);
   const q = (a, f) => a[Math.min(a.length - 1, Math.floor(f * (a.length - 1)))];
@@ -137,27 +231,64 @@ function box(soldiers, qlo, qhi) {
 }
 
 const cv = $('map'), ctx = cv.getContext('2d');
-const view = { k: 1, ox: 0, oy: 0 };
+const view = { k: 1, ox: 0, oy: 0 }; // pixels per meter, screen position of the world point (L, T)
 let W = 0, H = 0, DPR = 1;
-let hovered = null; // the vehicle route point under the pointer: {i, t, x, z}
-const sx = x => mx(x) * view.k + view.ox;
-const sy = z => my(z) * view.k + view.oy;
+const sx = x => (x - L) * view.k + view.ox;
+const sy = z => (T - z) * view.k + view.oy;
 
-function fitWorld(b, pad = 1.25) {
-  const x0 = mx(b.l), x1 = mx(b.r), y0 = my(b.t), y1 = my(b.b);
-  const bw = Math.max(x1 - x0, 15) * pad, bh = Math.max(y1 - y0, 15) * pad;
-  view.k = Math.min(MAX_ZOOM, Math.max(0.15, Math.min(W / bw, H / bh)));
-  view.ox = W / 2 - (x0 + x1) / 2 * view.k;
-  view.oy = H / 2 - (y0 + y1) / 2 * view.k;
+function fitWorld(b, pad = 1.2) {
+  const bw = Math.max(b.r - b.l, 30) * pad, bh = Math.max(b.t - b.b, 30) * pad;
+  view.k = Math.min(MAX_ZOOM, Math.max(0.05, Math.min(W / bw, H / bh)));
+  view.ox = W / 2 - ((b.l + b.r) / 2 - L) * view.k;
+  view.oy = H / 2 - (T - (b.t + b.b) / 2) * view.k;
   draw();
 }
-const fitBattle = () => fitWorld(box(allSoldiers, 0.02, 0.98));
+const fitBattle = () => fitWorld(box(D.soldiers, 0.02, 0.98));
 function fitPoints(pts, minSide = 150) {
   if (!pts.length) return;
   const xs = pts.map(p => p[0]), zs = pts.map(p => p[1]);
   const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cz = (Math.min(...zs) + Math.max(...zs)) / 2;
   const hw = Math.max(Math.max(...xs) - Math.min(...xs), minSide) / 2, hh = Math.max(Math.max(...zs) - Math.min(...zs), minSide) / 2;
-  fitWorld({ l: cx - hw, r: cx + hw, b: cz - hh, t: cz + hh }, 1.2);
+  fitWorld({ l: cx - hw, r: cx + hw, b: cz - hh, t: cz + hh });
+}
+
+// ---------- selection
+// related tells what the selection is about, so the rest of the map can step back:
+// soldiers, vehicles, spawns and kills of a player, the crew and the kills of a vehicle.
+let REL = null;
+function related() {
+  const sel = state.sel;
+  if (!sel) return null;
+  const r = { soldiers: new Set(), vehicles: new Set(), spawns: new Set(), kills: new Set(), structures: new Set(), points: new Set(), downs: new Set() };
+  if (sel.type === 'player') {
+    D.soldiers.forEach((s, i) => { if (s.player === sel.id) r.soldiers.add(i); });
+    D.vehicles.forEach((v, i) => { if (v.player === sel.id) r.vehicles.add(i); });
+    D.structures.forEach((s, i) => { if (s.player === sel.id) r.structures.add(i); });
+    D.spawns.forEach((s, i) => { if (s.player === sel.id) r.spawns.add(i); });
+    KILLS.forEach((k, i) => { if (k.player === sel.id || k.byPlayer === sel.id) r.kills.add(i); });
+  } else if (sel.type === 'vehicle') {
+    const v = D.vehicles[sel.id];
+    r.vehicles.add(sel.id);
+    v.crew.forEach(i => r.soldiers.add(i));
+    KILLS.forEach((k, i) => {
+      if (k.vehicle === sel.id) r.kills.add(i);
+      // a kill by the crew while the vehicle went on, with a weapon of a vehicle or a plane
+      else if (v.crew.includes(k.by) && k.t >= v.spawned && k.t <= (v.destroyed || END) && (k.group === 'vehicle' || k.group === 'air')) r.kills.add(i);
+    });
+    if (v.structure >= 0) r.structures.add(v.structure);
+  } else if (sel.type === 'spawn') {
+    const p = SPAWN_POINTS[sel.id];
+    r.points.add(sel.id);
+    p.spawns.forEach(i => r.spawns.add(i));
+    if (p.from === 'apc') r.vehicles.add(p.ref);
+  } else if (sel.type === 'structure') {
+    r.structures.add(sel.id);
+  } else if (sel.type === 'kill') {
+    r.kills.add(sel.id);
+  } else if (sel.type === 'down') {
+    r.downs.add(sel.id);
+  }
+  return r;
 }
 
 // ---------- heatmap
@@ -165,7 +296,7 @@ function fitPoints(pts, minSide = 150) {
 // about 600 cells a side, so it is rebuilt at once when a filter changes.
 const heat = { key: '', canvas: document.createElement('canvas') };
 (function heatGrid() {
-  const b = box(allSoldiers, 0.01, 0.99), pad = 150;
+  const b = box(D.soldiers, 0.01, 0.99), pad = 150;
   const wm = b.r - b.l + 2 * pad, hm = b.t - b.b + 2 * pad;
   heat.cell = Math.max(3, Math.max(wm, hm) / 600);
   heat.l = b.l - pad; heat.t = b.t + pad;
@@ -177,8 +308,10 @@ const heat = { key: '', canvas: document.createElement('canvas') };
 function buildHeat() {
   const { w, h, cell } = heat;
   const g = new Float32Array(w * h);
-  for (const s of D.soldiers) {
-    if (!ofTeam(s.team)) continue;
+  // the heat of a player when one is chosen
+  const only = REL && state.sel.type === 'player' ? REL.soldiers : null;
+  D.soldiers.forEach((s, si) => {
+    if (!ofTeam(s.team) || (only && !only.has(si))) return;
     const tr_ = s.track;
     for (let i = 0; i < tr_.length; i += 3) {
       const t = tr_[i];
@@ -186,7 +319,7 @@ function buildHeat() {
       const cx = Math.floor((tr_[i + 1] - heat.l) / cell), cy = Math.floor((heat.t - tr_[i + 2]) / cell);
       if (cx >= 0 && cy >= 0 && cx < w && cy < h) g[cy * w + cx]++;
     }
-  }
+  });
   blur(g, w, h, 2); blur(g, w, h, 2);
   const vals = [];
   for (const v of g) if (v > 0.01) vals.push(v);
@@ -197,7 +330,7 @@ function buildHeat() {
     const v = Math.min(1, g[i] / top);
     if (v < 0.03) continue;
     const [r, gg, b] = ramp(v);
-    img.data.set([r, gg, b, Math.round(255 * Math.min(0.8, 0.1 + v))], i * 4);
+    img.data.set([r, gg, b, Math.round(255 * Math.min(0.75, 0.08 + v))], i * 4);
   }
   heat.canvas.getContext('2d').putImageData(img, 0, 0);
 }
@@ -236,27 +369,47 @@ function ramp(v) {
 }
 
 // ---------- markers
-// A marker is a Lucide icon on a disc of the team color. The same SVG is used on the
-// map and in the legend, so they look alike.
-function markerSVG(name, color, px) {
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${px}" height="${px}" viewBox="0 0 32 32">` +
-    `<circle cx="16" cy="16" r="14.6" fill="${color}" stroke="#ffffff" stroke-width="2"/>` +
-    `<g transform="translate(8 8) scale(.6667)" fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</g></svg>`;
+// A marker is a symbol on a disc of the team color. Something destroyed is a dark disc
+// with a ring of the team color and a flash. The same SVG is used on the map, in the
+// panel and in the card, so they look alike.
+function markerSVG(name, color, px, dead, square) {
+  const shape = square ? '<rect x="1.6" y="1.6" width="28.8" height="28.8" rx="6"' : '<circle cx="16" cy="16" r="14.5"';
+  const disc = dead
+    ? `${shape} fill="#262b31" stroke="${color}" stroke-width="2.6"/>`
+    : `${shape} fill="${color}" stroke="#ffffff" stroke-width="2"/>`;
+  const flash = dead ? `<circle cx="25.5" cy="25.5" r="6.2" fill="#262b31"/>` +
+    `<g transform="translate(18.6 18.6) scale(.027)" fill="#ffa53a">${GLYPHS.burst}</g>` : '';
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${px}" height="${px}" viewBox="-1 -1 34 34">${disc}` +
+    `<g transform="translate(5 5) scale(.043)" fill="${dead ? '#c9ced3' : '#ffffff'}">${GLYPHS[name]}</g>${flash}</svg>`;
 }
-const markerURL = (name, color, px) => 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(markerSVG(name, color, px));
+const markerURL = (name, color, px, dead, square) => 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(markerSVG(name, color, px, dead, square));
+const markerImg = (name, color, dead, square) => `<img class="mk" src="${markerURL(name, color, 40, dead, square)}" alt="">`;
 const sprites = new Map();
-function marker(name, color, size, x, y, alpha = 1) {
-  const key = `${name}|${color}|${size}|${DPR}`;
+function marker(name, color, size, x, y, alpha = 1, dead = false, square = false) {
+  const key = `${name}|${color}|${size}|${DPR}|${dead}|${square}`;
   let img = sprites.get(key);
   if (!img) {
     img = new Image();
     img.onload = draw;
-    img.src = markerURL(name, color, Math.round(size * DPR));
+    img.src = markerURL(name, color, Math.round(size * DPR), dead, square);
     sprites.set(key, img);
   }
   if (!img.complete || !img.naturalWidth) return;
   ctx.globalAlpha = alpha;
   ctx.drawImage(img, Math.round(x - size / 2), Math.round(y - size / 2), size, size);
+  ctx.globalAlpha = 1;
+}
+// badge draws a number in a pill at the top right of a marker.
+function badge(n, x, y, size, alpha) {
+  const text = String(n);
+  ctx.font = `700 11px ${P.body}`;
+  const w = Math.max(16, ctx.measureText(text).width + 8), h = 15, bx = x + size * 0.28, by = y - size * 0.62;
+  ctx.globalAlpha = alpha;
+  ctx.beginPath(); ctx.roundRect(bx, by, w, h, h / 2);
+  ctx.fillStyle = '#ffffff'; ctx.fill();
+  ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(15,17,19,.45)'; ctx.stroke();
+  ctx.fillStyle = '#1c2228'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, bx + w / 2, by + h / 2 + 0.5);
   ctx.globalAlpha = 1;
 }
 
@@ -275,67 +428,58 @@ function path(points) {
 function stroke(color, width, alpha = 1, casing = 'rgba(15,17,19,.55)') {
   ctx.lineJoin = 'round'; ctx.lineCap = 'round';
   ctx.globalAlpha = alpha;
-  ctx.strokeStyle = casing; ctx.lineWidth = width + 2; ctx.stroke();
+  if (casing) { ctx.strokeStyle = casing; ctx.lineWidth = width + 2; ctx.stroke(); }
   ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
   ctx.globalAlpha = 1;
 }
-
-// shownVehicles are the vehicles of the chosen team in the battle in the chosen time.
-function shownVehicles() {
-  return D.vehicles.map((v, i) => [v, i]).filter(([v]) => v.track.length && ofTeam(v.team) && v.player >= 0 &&
-    (state.planes || v.kind !== 'plane') && overlaps(v.spawned, v.destroyed || END));
+function dot(x, y, r, fill, line, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (line) { ctx.lineWidth = 1.4; ctx.strokeStyle = line; ctx.stroke(); }
+  ctx.globalAlpha = 1;
 }
-// shownStructures are the structures of the chosen team built in the chosen time.
-function shownStructures() {
-  return D.structures.map((s, i) => [s, i]).filter(([s]) => (s.rally || state.other) && ofTeam(s.team) && s.built >= state.t0 && s.built <= state.t1)
-    .sort((a, b) => a[0].built - b[0].built);
-}
-function vehiclePath(v) {
-  ctx.beginPath();
-  let started = false;
-  for (let i = 0; i < v.track.length; i += 3) {
-    const t = v.track[i];
-    if (t < state.t0 || t > state.t1) { started = false; continue; }
-    const x = sx(v.track[i + 1]), y = sy(v.track[i + 2]);
-    started ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    started = true;
-  }
-}
-// vehiclePoint is the first route point at or after t (dir 1) or the last at or before t
-// (dir -1), within the chosen time.
-function vehiclePoint(v, t, dir) {
-  const tr_ = v.track;
-  let p = null;
-  for (let i = 0; i < tr_.length; i += 3) {
-    const pt = tr_[i];
-    if (pt < state.t0 || pt > state.t1) continue;
-    if (dir > 0 && pt >= t) return [tr_[i + 1], tr_[i + 2]];
-    if (dir < 0 && pt <= t) p = [tr_[i + 1], tr_[i + 2]];
-  }
-  return p;
+// line draws a kill line from where the killer was to the victim, with an arrowhead.
+function killLine(k, alpha) {
+  if (k.fx == null) return;
+  const x0 = sx(k.fx), y0 = sy(k.fz), x1 = sx(k.x), y1 = sy(k.z), a = Math.atan2(y1 - y0, x1 - x0);
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1);
+  stroke(teamColor(k.byTeam), 1.6, alpha, 'rgba(15,17,19,.4)');
+  ctx.globalAlpha = alpha;
+  ctx.beginPath(); ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - 8 * Math.cos(a - 0.4), y1 - 8 * Math.sin(a - 0.4));
+  ctx.lineTo(x1 - 8 * Math.cos(a + 0.4), y1 - 8 * Math.sin(a + 0.4));
+  ctx.closePath(); ctx.fillStyle = teamColor(k.byTeam); ctx.fill();
+  dot(x0, y0, 3, '#ffffff', teamColor(k.byTeam), alpha);
+  ctx.globalAlpha = 1;
 }
 
-let deathCache = null;
-// deaths lists the deaths in the chosen time with their places.
-function deaths() {
-  if (!deathCache) deathCache = D.soldiers.map(s => {
-    if (!s.died) return null;
-    const p = posAt(s.track, s.died);
-    return p && { t: s.died, x: p[0], z: p[1], team: s.team, player: s.player, killer: s.killer };
-  }).filter(Boolean);
-  return deathCache.filter(d => d.t >= state.t0 && d.t <= state.t1 && ofTeam(d.team));
-}
+// hits are the things drawn in the last frame that the pointer can pick, topmost last.
+let hits = [];
+const hit = (x, y, r, obj, tipHTML) => hits.push({ x, y, r, obj, tip: tipHTML });
+
+// shown* are the objects of the layers within the chosen team and time.
+const shownVehicles = () => D.vehicles.map((v, i) => [v, i]).filter(([v]) =>
+  v.track.length && v.player >= 0 && ofTeam(v.team) && state.kinds.has(v.kind) && overlaps(v.spawned, v.destroyed));
+const shownStructures = () => D.structures.map((s, i) => [s, i]).filter(([s]) => !s.rally && ofTeam(s.team) && overlaps(s.built, s.removed));
+const shownKills = () => KILLS.map((k, i) => [k, i]).filter(([k]) => inTime(k.t) && ofTeam(k.team) && state.groups.has(k.group));
+const shownDowns = () => DOWNS.map((d, i) => [d, i]).filter(([d]) => inTime(d.t) && ofTeam(d.team));
+const pointSpawns = p => p.spawns.filter(i => inTime(D.spawns[i].t) && ofTeam(D.spawns[i].team));
+const shownSpawnPoints = () => SPAWN_POINTS.map((p, i) => [p, i]).filter(([p]) => ofTeam(p.team) && spawnPointOpen(p));
 
 function render() {
   frame = 0;
+  REL = related();
+  hits = [];
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.fillStyle = P.mapbg;
   ctx.fillRect(0, 0, W, H);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   if (D.map && mapImg.complete && mapImg.naturalWidth) {
-    ctx.drawImage(mapImg, view.ox, view.oy, S * view.k, S * view.k);
-    if (P.dark) { ctx.fillStyle = 'rgba(15,17,19,.3)'; ctx.fillRect(view.ox, view.oy, S * view.k, S * view.k); }
+    const x0 = sx(L), y0 = sy(T), w = (R - L) * view.k, h = (T - B) * view.k;
+    ctx.drawImage(mapImg, x0, y0, w, h);
+    if (P.dark) { ctx.fillStyle = 'rgba(15,17,19,.3)'; ctx.fillRect(x0, y0, w, h); }
   } else grid();
 
   // battle areas only for a part of the battle: over the whole battle they pile up
@@ -353,81 +497,170 @@ function render() {
   for (const z of zones) {
     const owner = ownerAt(z, state.t1), color = owner > 0 ? teamColor(owner) : P.label;
     zoneShape(z);
-    ctx.fillStyle = color; ctx.globalAlpha = state.mode === 'fight' ? 0.12 : 0.2; ctx.fill(); ctx.globalAlpha = 1;
+    ctx.fillStyle = color; ctx.globalAlpha = 0.14; ctx.fill(); ctx.globalAlpha = 1;
     stroke(color, 1.5);
   }
 
-  if (state.mode === 'fight' || state.heat) drawHeat();
-  if (state.mode === 'fight') renderDeaths();
-  else if (state.mode === 'vehicles') renderVehicles();
-  else renderStructures();
+  if (state.layers.heat) drawHeat();
+  if (state.layers.structures) drawStructures();
+  if (state.layers.vehicles) drawVehicles();
+  if (state.layers.spawns) drawSpawns();
+  if (state.layers.downs) drawDowns();
+  drawKills();
 
   for (const z of zones) zoneLabel(z);
   scaleBar();
   timeline.render();
 }
 
+const faded = (rel, set, i) => !REL ? 1 : REL[set].has(i) ? 1 : rel;
+
 function drawHeat() {
-  const key = [state.team, state.skipSpawn, state.t0, state.t1].join('|');
+  const key = [state.team, state.skipSpawn, state.t0, state.t1, state.sel && state.sel.type === 'player' ? state.sel.id : ''].join('|');
   if (key !== heat.key) { buildHeat(); heat.key = key; }
-  const s = heat.cell / metersPerUnit * view.k;
+  const s = heat.cell * view.k;
   ctx.drawImage(heat.canvas, sx(heat.l), sy(heat.t), heat.w * s, heat.h * s);
 }
 
-function renderDeaths() {
-  if (state.deaths) for (const d of deaths()) {
-    ctx.beginPath(); ctx.arc(sx(d.x), sy(d.z), 2.6, 0, Math.PI * 2);
-    ctx.fillStyle = teamColor(d.team); ctx.fill();
-    ctx.lineWidth = 1.2; ctx.strokeStyle = '#fff'; ctx.stroke();
+function drawStructures() {
+  for (const [s, i] of shownStructures()) {
+    const a = faded(0.3, 'structures', i), dead = s.removed && s.removed <= state.t1;
+    const x = sx(s.pos[0]), y = sy(s.pos[1]), size = 18;
+    marker(glyphOfStructure(s.kind), teamColor(s.team), size, x, y, a, dead);
+    hit(x, y, size / 2 + 2, { type: 'structure', id: i }, `<b>${esc(structureName(s))}</b><div>${tr('builtBy', colored(playerName(s.player), s.team), clock(s.built))}</div>`);
   }
 }
 
-function renderVehicles() {
-  const vs = shownVehicles(), focus = state.hot || state.sel;
-  const dim = i => !focus || focus.id === i ? 1 : 0.3;
+// vehicleRoute strokes the part of a route within the chosen time.
+function vehicleRoute(v) {
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < v.track.length; i += 3) {
+    const t = v.track[i];
+    if (t < state.t0 || t > state.t1) { started = false; continue; }
+    const x = sx(v.track[i + 1]), y = sy(v.track[i + 2]);
+    started ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    started = true;
+  }
+}
+const vehicleGlyph = v => ({ tank: 'tank', apc: 'apc', plane: 'plane', bike: 'bike', gun: 'gunAT', ship: 'boat' })[v.kind] || 'car';
+
+function drawVehicles() {
+  const vs = shownVehicles();
   for (const [v, i] of vs) {
-    const plane = v.kind === 'plane', w = plane ? 1 : 1.75;
-    vehiclePath(v);
-    if ((focus && focus.id === i) || (hovered && hovered.i === i)) stroke(P.select, w + 3, 0.9, 'transparent');
-    stroke(teamColor(v.team), w, dim(i) * (plane ? 0.75 : 0.95));
+    const plane = v.kind === 'plane', a = faded(0.2, 'vehicles', i);
+    const on = REL && REL.vehicles.has(i);
+    vehicleRoute(v);
+    if (on || same(state.hot, { type: 'vehicle', id: i })) stroke(P.select, (plane ? 1 : 2) + 3.5, 0.85, null);
+    stroke(teamColor(v.team), plane ? 1 : 2, a * (plane ? 0.7 : 0.95));
   }
   for (const [v, i] of vs) {
-    const first = vehiclePoint(v, state.t0, 1);
-    if (first) marker(v.kind === 'plane' ? 'plane' : 'car', teamColor(v.team), 18, sx(first[0]), sy(first[1]), dim(i));
-    if (v.destroyed && v.destroyed >= state.t0 && v.destroyed <= state.t1) {
-      const p = vehiclePoint(v, v.destroyed, -1);
-      if (p) marker('x', teamColor(v.team), 16, sx(p[0]), sy(p[1]), dim(i));
+    const a = faded(0.25, 'vehicles', i);
+    const dead = v.destroyed && v.destroyed <= state.t1;
+    const p = posAt(v.track, dead ? v.destroyed : Math.min(state.t1, v.destroyed || END));
+    if (!p) continue;
+    const x = sx(p[0]), y = sy(p[1]), size = 22;
+    marker(vehicleGlyph(v), teamColor(v.team), size, x, y, a, dead);
+    hit(x, y, size / 2 + 2, { type: 'vehicle', id: i }, vehicleTip(v));
+  }
+}
+function vehicleTip(v) {
+  return `<b>${esc(vehicleName(v))}</b><div>${colored(playerName(v.player), v.team)}</div>` +
+    `<div class="m">${v.destroyed ? tr('knockedOutAt', clock(v.destroyed)) : tr('survivedBattle')}</div>`;
+}
+
+function drawSpawns() {
+  for (const [p, i] of shownSpawnPoints()) {
+    const n = pointSpawns(p), a = faded(0.3, 'points', i), color = teamColor(p.team);
+    if (p.from === 'apc') {
+      // an APC moves: a mark at each place squads left it
+      for (const si of n) {
+        const s = D.spawns[si], x = sx(s.pos[0]), y = sy(s.pos[1]);
+        marker('apc', color, 18, x, y, a);
+        hit(x, y, 11, { type: 'spawn', id: i }, spawnTip(p, n.length));
+      }
+      continue;
+    }
+    const dead = p.b && p.b <= state.t1;
+    // a base that closed before the end of the chosen time steps back, as the zones show
+    // who held them at the end
+    const closed = p.from === 'base' && !p.active.some(([s, e]) => s <= state.t1 && e >= state.t1 - 1);
+    const x = sx(p.pos[0]), y = sy(p.pos[1]), size = p.from === 'rally' ? 24 : closed ? 20 : 26, alpha = closed ? a * 0.5 : a;
+    marker(spawnGlyph(p), color, size, x, y, alpha, dead && p.from === 'rally', p.from === 'base');
+    if (n.length) badge(n.length, x, y, size, alpha);
+    hit(x, y, size / 2 + 2, { type: 'spawn', id: i }, spawnTip(p, n.length));
+  }
+  if (REL && REL.spawns.size) for (const i of REL.spawns) {
+    const s = D.spawns[i];
+    if (!inTime(s.t)) continue;
+    dot(sx(s.pos[0]), sy(s.pos[1]), 3.2, teamColor(s.team), '#ffffff');
+  }
+}
+const spawnTip = (p, n) => `<b>${esc(spawnPointName(p))}</b><div>${tr('squadsHere', n)}</div>` +
+  (p.player >= 0 ? `<div class="m">${colored(playerName(p.player), p.team)}</div>` : '');
+
+function drawDowns() {
+  for (const [d, i] of shownDowns()) {
+    const a = REL ? (REL.downs.has(i) || REL.soldiers.has(d.soldier) || REL.soldiers.has(d.by) ? 1 : 0.2) : 1;
+    const x = sx(d.x), y = sy(d.z);
+    if (REL && REL.downs.has(i)) marker('downed', teamColor(d.team), 20, x, y);
+    dot(x, y, 3.6, d.revived ? '#ffffff' : null, teamColor(d.team), a);
+    dot(x, y, 2.2, null, teamColor(d.team), a);
+    hit(x, y, 6, { type: 'down', id: i }, downTip(d));
+  }
+}
+function downTip(d) {
+  const by = d.by >= 0 ? D.soldiers[d.by] : null;
+  return `<b>${colored(playerName(d.player), d.team)}</b>` +
+    (by ? `<div>${tr('downedBy', colored(playerName(by.player), by.team))}</div>` : '') + `<div>${tr('timeAt', clock(d.t))}</div>` +
+    `<div class="m">${d.revived ? tr('revived', clock(d.revived)) : tr('notRevived')}</div>`;
+}
+
+// drawKills draws the deaths layer, and the kills of the selection as lines from the
+// killer to the victim even when the layer is off.
+function drawKills() {
+  const ks = state.layers.deaths ? shownKills() : [];
+  for (const [k, i] of ks) {
+    if (k.vehicle != null) continue; // vehicles show where they were knocked out themselves
+    const a = REL ? (REL.kills.has(i) ? 1 : 0.18) : 0.9, x = sx(k.x), y = sy(k.z);
+    dot(x, y, k.headshot ? 3.4 : 2.8, teamColor(k.team), '#ffffff', a);
+    hit(x, y, 6, { type: 'kill', id: i }, killTip(k));
+  }
+  if (!REL) return;
+  for (const i of REL.kills) {
+    const k = KILLS[i];
+    if (!inTime(k.t) || !ofTeam(k.team) && !ofTeam(k.byTeam)) continue;
+    killLine(k, 0.95);
+    if (k.vehicle == null) {
+      const x = sx(k.x), y = sy(k.z);
+      marker('skull', teamColor(k.team), 20, x, y);
+      hit(x, y, 11, { type: 'kill', id: i }, killTip(k));
     }
   }
-  if (hovered) {
-    ctx.beginPath(); ctx.arc(sx(hovered.x), sy(hovered.z), 5, 0, Math.PI * 2);
-    ctx.fillStyle = '#fff'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = '#111'; ctx.stroke();
-  }
 }
-
-function renderStructures() {
-  const focus = state.hot || state.sel;
-  for (const [s, i] of shownStructures()) {
-    const on = focus && focus.id === i, a = !focus || on ? 1 : 0.35, size = (s.rally ? 20 : 15) + (on ? 4 : 0);
-    if (on) { ctx.beginPath(); ctx.arc(sx(s.pos[0]), sy(s.pos[1]), size / 2 + 4, 0, Math.PI * 2); ctx.fillStyle = P.select; ctx.globalAlpha = 0.85; ctx.fill(); ctx.globalAlpha = 1; }
-    marker(s.rally ? 'tent' : 'hammer', teamColor(s.team), size, sx(s.pos[0]), sy(s.pos[1]), a);
-  }
+function killTip(k) {
+  const victim = k.vehicle != null ? `${vehicleName(D.vehicles[k.vehicle])} (${playerName(k.player)})` : playerName(k.player);
+  let head;
+  if (k.by < 0) head = `<b>${colored(victim, k.team)}</b><div>${tr('notBySoldier')}</div>`;
+  else if (k.by === k.soldier) head = `<b>${colored(victim, k.team)}</b><div>${tr('suicide')}</div>`;
+  else head = `<b>${tr('killedBy', colored(playerName(k.byPlayer), k.byTeam), colored(victim, k.team))}</b>`;
+  const rows = [weaponName(k.weapon) && tr('weapon', esc(weaponName(k.weapon))), k.dist != null && tr('shotFrom', k.dist), k.headshot && tr('headshotRow'), tr('timeAt', clock(k.t))];
+  return head + rows.filter(Boolean).map(r => `<div>${r}</div>`).join('');
 }
 
 function grid() {
-  const step = 100 / metersPerUnit * view.k;
+  const step = 100 * view.k;
   ctx.strokeStyle = P.line; ctx.lineWidth = 1;
   ctx.beginPath();
-  for (let v = 0; v <= S * view.k + 0.5; v += step) {
-    ctx.moveTo(view.ox + v, view.oy); ctx.lineTo(view.ox + v, view.oy + S * view.k);
-    ctx.moveTo(view.ox, view.oy + v); ctx.lineTo(view.ox + S * view.k, view.oy + v);
-  }
+  const x0 = sx(L), y0 = sy(T), w = (R - L) * view.k, h = (T - B) * view.k;
+  for (let v = 0; v <= w + 0.5; v += step) { ctx.moveTo(x0 + v, y0); ctx.lineTo(x0 + v, y0 + h); }
+  for (let v = 0; v <= h + 0.5; v += step) { ctx.moveTo(x0, y0 + v); ctx.lineTo(x0 + w, y0 + v); }
   ctx.stroke();
 }
 
 function zoneShape(z) {
   if (z.area && z.area.length > 2) path(z.area);
-  else { ctx.beginPath(); ctx.arc(sx(z.pos[0]), sy(z.pos[1]), Math.max(z.radius || 10, 4) / metersPerUnit * view.k, 0, Math.PI * 2); }
+  else { ctx.beginPath(); ctx.arc(sx(z.pos[0]), sy(z.pos[1]), Math.max(z.radius || 10, 4) * view.k, 0, Math.PI * 2); }
 }
 
 // zoneLabel draws the zone's letter in a disc, or its name in a pill, edged in the owner's color.
@@ -441,17 +674,25 @@ function zoneLabel(z) {
   ctx.lineWidth = 1.75; ctx.strokeStyle = color; ctx.stroke();
   ctx.fillStyle = P.labelText; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(text, x, y + 1);
+  hit(x, y, Math.max(w, h) / 2, null, zoneTip(z));
+}
+function zoneTip(z) {
+  const sec = SECTORS.find(s => s.zones.includes(z));
+  const owners = (z.owners || []).map(([t, o]) => `${clock(t)} ${o > 0 ? colored(teamName(o), o) : tr('nobody')}`).join(', ');
+  return `<b>${esc(z.title ? `${z.title}, ${zoneName(z)}` : zoneName(z))}</b>` +
+    (sec ? `<div>${tr('sectorSpan', sec.n, clock(sec.a), clock(sec.b))}</div>` : '') +
+    (owners ? `<div class="m">${tr('owners')}: ${owners}</div>` : '');
 }
 
 function scaleBar() {
-  const target = 110 / view.k * metersPerUnit;
+  const target = 110 / view.k;
   const m = [2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000].find(v => v >= target * 0.6) || 5000;
-  $('scale').innerHTML = `<i style="width:${m / metersPerUnit * view.k}px"></i>${tr('meters', m)}`;
+  $('scale').innerHTML = `<i style="width:${m * view.k}px"></i>${tr('meters', m)}`;
 }
 
 // ---------- map pointer
 function zoomAt(f, px, py) {
-  const k = Math.min(MAX_ZOOM, Math.max(0.15, view.k * f));
+  const k = Math.min(MAX_ZOOM, Math.max(0.05, view.k * f));
   view.ox = px - (px - view.ox) * k / view.k;
   view.oy = py - (py - view.oy) * k / view.k;
   view.k = k;
@@ -472,108 +713,156 @@ cv.addEventListener('pointermove', e => {
 });
 cv.addEventListener('pointerup', e => {
   if (drag && !drag.moved) {
-    const hit = pick(e.offsetX, e.offsetY);
-    select(hit && hit.obj ? hit.obj : null, false);
+    const h = pick(e.offsetX, e.offsetY) || routeAt(e.offsetX, e.offsetY);
+    if (h && h.obj) select(h.obj, false);
+    else if (!h) select(null);
   }
   drag = null; cv.classList.remove('drag');
 });
-cv.addEventListener('pointerleave', () => { $('tip').style.display = 'none'; markRow(null); if (hovered) { hovered = null; draw(); } });
+cv.addEventListener('pointerleave', () => { $('tip').style.display = 'none'; });
 $('zoomIn').onclick = () => zoomAt(1.5, W / 2, H / 2);
 $('zoomOut').onclick = () => zoomAt(1 / 1.5, W / 2, H / 2);
 $('zoomFit').onclick = fitBattle;
 
 const colored = (text, t) => `<span style="color:${teamColor(t)}">${esc(text)}</span>`;
-// pick finds what is under the pointer in the current mode: {obj, html, route} or null.
+// pick finds the topmost thing drawn under the pointer.
 function pick(px, py) {
-  const near = (x, z, r) => Math.hypot(sx(x) - px, sy(z) - py) <= r;
-  for (const z of D.zones.filter(zoneActive)) if (near(z.pos[0], z.pos[1], 15)) return { html: zoneTip(z) };
-  if (state.mode === 'structures') {
-    for (const [s, i] of shownStructures()) {
-      if (!near(s.pos[0], s.pos[1], s.rally ? 13 : 10)) continue;
-      return { obj: { type: 'structure', id: i }, html: structureTip(s) };
-    }
-  } else if (state.mode === 'vehicles') {
-    let best = 10, hit = null;
-    for (const [v, i] of shownVehicles()) {
-      const tr_ = v.track;
-      for (let j = 0; j < tr_.length; j += 3) {
-        if (tr_[j] < state.t0 || tr_[j] > state.t1) continue;
-        const d = Math.hypot(sx(tr_[j + 1]) - px, sy(tr_[j + 2]) - py);
-        if (d < best) { best = d; hit = { i, t: tr_[j], x: tr_[j + 1], z: tr_[j + 2] }; }
-      }
-    }
-    if (hit) {
-      const v = D.vehicles[hit.i];
-      return {
-        obj: { type: 'vehicle', id: hit.i }, route: hit,
-        html: `<b>${esc(vehicleName(v))}</b><div>${colored(playerName(v.player), v.team)}</div>` +
-          `<div>${tr('hereAt', clock(hit.t))}</div><div class="m">${vehicleLife(v)}</div>`,
-      };
-    }
-  } else if (state.deaths) {
-    for (const d of deaths()) {
-      if (!near(d.x, d.z, 6)) continue;
-      return {
-        html: `<b>${colored(playerName(d.player), d.team)}</b><div class="m">` +
-          (d.killer >= 0 && d.killer !== d.player ? tr('killedBy', clock(d.t), colored(playerName(d.killer), D.players[d.killer].team)) : tr('killedAt', clock(d.t))) + '</div>',
-      };
-    }
-  }
+  for (let i = hits.length - 1; i >= 0; i--) if (Math.hypot(hits[i].x - px, hits[i].y - py) <= hits[i].r) return hits[i];
   return null;
 }
-const vehicleLife = v => v.destroyed ? tr('vehicleLife', clock(v.spawned), clock(v.destroyed)) : tr('vehicleLifeEnd', clock(v.spawned));
-function structureTip(s) {
-  return `<b>${esc(s.rally ? tr('rallyPoint') : structureName(s))}</b>` +
-    `<div>${tr('builtBy', colored(playerName(s.player), s.team), clock(s.built))}</div>` +
-    `<div class="m">${s.removed ? tr('destroyedAt', clock(s.removed)) : tr('notDestroyed')}</div>`;
-}
-function zoneTip(z) {
-  const sec = SECTORS.find(s => s.zones.includes(z));
-  const owners = (z.owners || []).map(([t, o]) => `${clock(t)} ${o > 0 ? colored(tr('team', o), o) : tr('nobody')}`).join(', ');
-  return `<b>${esc(z.title ? `${z.title}, ${zoneName(z)}` : zoneName(z))}</b>` +
-    (sec ? `<div>${tr('sectorSpan', sec.n, clock(sec.a), clock(sec.b))}</div>` : '') +
-    (owners ? `<div class="m">${tr('owners')}: ${owners}</div>` : '');
+// routeAt finds a vehicle route near the pointer.
+function routeAt(px, py) {
+  if (!state.layers.vehicles) return null;
+  let best = 7, found = null;
+  for (const [v, i] of shownVehicles()) {
+    const tr_ = v.track;
+    for (let j = 0; j < tr_.length; j += 3) {
+      if (tr_[j] < state.t0 || tr_[j] > state.t1) continue;
+      const d = Math.hypot(sx(tr_[j + 1]) - px, sy(tr_[j + 2]) - py);
+      if (d < best) { best = d; found = { obj: { type: 'vehicle', id: i }, tip: vehicleTip(v) + `<div class="m">${tr('timeAt', clock(tr_[j]))}</div>` }; }
+    }
+  }
+  return found;
 }
 
 function hover(px, py) {
-  const hit = pick(px, py);
-  const route = hit && hit.route || null;
-  if ((route ? route.i + ':' + route.t : '') !== (hovered ? hovered.i + ':' + hovered.t : '')) { hovered = route; draw(); }
-  cv.classList.toggle('point', !!(hit && hit.obj));
-  markRow(hit && hit.obj);
+  const h = pick(px, py) || routeAt(px, py);
+  cv.classList.toggle('point', !!(h && h.obj));
+  const hot = h && h.obj && h.obj.type === 'vehicle' ? h.obj : null;
+  if (!same(hot, state.hot) && (hot || state.hot)) { state.hot = hot; draw(); }
   const tip = $('tip');
-  if (!hit) { tip.style.display = 'none'; return; }
-  tip.innerHTML = hit.html;
+  if (!h || !h.tip) { tip.style.display = 'none'; return; }
+  tip.innerHTML = h.tip;
   tip.style.display = 'block';
   tip.style.left = Math.min(px + 16, W - tip.offsetWidth - 8) + 'px';
   tip.style.top = Math.min(py + 16, H - tip.offsetHeight - 8) + 'px';
 }
-const rowSelector = obj => `#panel [data-type="${obj.type}"][data-id="${obj.id}"]`;
-function markRow(obj) {
-  document.querySelectorAll('#panel .hot').forEach(e => e.classList.remove('hot'));
-  const row = obj && document.querySelector(rowSelector(obj));
-  if (row) row.classList.add('hot');
-}
 
-// select makes obj the selection, or clears it when it is already selected.
+// select makes obj the selection, or clears it when it is already selected. fit moves
+// the map to it.
 function select(obj, fit) {
   state.sel = obj && !same(obj, state.sel) ? obj : null;
-  state.hot = null;
-  renderPanel();
+  REL = related();
+  renderCard(); renderLists();
   if (fit && state.sel) {
-    if (state.sel.type === 'vehicle') {
-      const tr_ = D.vehicles[state.sel.id].track, pts = [];
-      for (let i = 0; i < tr_.length; i += 3) pts.push([tr_[i + 1], tr_[i + 2]]);
-      fitPoints(pts);
-    } else fitPoints([D.structures[state.sel.id].pos]);
+    const pts = selectionPoints();
+    if (pts.length) fitPoints(pts, 120);
   }
-  const row = state.sel && document.querySelector(rowSelector(state.sel));
-  if (row) row.scrollIntoView({ block: 'nearest' });
   draw();
 }
+function selectionPoints() {
+  const sel = state.sel, pts = [];
+  const trackPts = tr_ => { for (let i = 0; i < tr_.length; i += 3) if (inTime(tr_[i])) pts.push([tr_[i + 1], tr_[i + 2]]); };
+  if (sel.type === 'vehicle') trackPts(D.vehicles[sel.id].track);
+  else if (sel.type === 'structure') pts.push(D.structures[sel.id].pos);
+  else if (sel.type === 'spawn') {
+    const p = SPAWN_POINTS[sel.id];
+    if (p.pos) pts.push(p.pos);
+    p.spawns.forEach(i => pts.push(D.spawns[i].pos));
+  } else if (sel.type === 'kill' || sel.type === 'down') {
+    const k = (sel.type === 'kill' ? KILLS : DOWNS)[sel.id];
+    pts.push([k.x, k.z]);
+    if (k.fx != null) pts.push([k.fx, k.fz]);
+  } else if (sel.type === 'player') {
+    KILLS.forEach(k => { if (inTime(k.t) && (k.player === sel.id || k.byPlayer === sel.id)) pts.push([k.x, k.z]); });
+  }
+  return pts;
+}
+
+// ---------- card of the selection
+function renderCard() {
+  const card = $('card'), sel = state.sel;
+  if (!sel) { card.hidden = true; return; }
+  let sym = '', title = '', sub = '', rows = [];
+  const row = (text, cls = '') => rows.push(`<p class="${cls}">${text}</p>`);
+  if (sel.type === 'player') {
+    const p = D.players[sel.id];
+    const mine = KILLS.filter(k => k.byPlayer === sel.id && enemyKill(k));
+    title = esc(p.name);
+    sub = [colored(teamName(p.team), p.team), p.platoon && tr('platoon', p.platoon), p.bot && tr('bot'), p.left && tr('leftAt', clock(p.left))].filter(Boolean).join(' · ');
+    const stats = [
+      [tr('statKills'), mine.filter(k => k.vehicle == null).length], [tr('statDeaths'), stat(p, 'soldierDeaths')],
+      [tr('statHeadshots'), mine.filter(k => k.headshot).length], [tr('statVehicles'), mine.filter(k => k.vehicle != null).length],
+      [tr('statScore'), stat(p, 'score')],
+    ];
+    rows.push(`<dl class="stats">${stats.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('')}</dl>`);
+    sym = `<span class="avatar" style="--c:${teamColor(p.team)}">${esc(p.name.charAt(0).toUpperCase())}</span>`;
+  } else if (sel.type === 'vehicle') {
+    const v = D.vehicles[sel.id];
+    sym = markerImg(vehicleGlyph(v), teamColor(v.team), !!v.destroyed);
+    title = esc(vehicleName(v));
+    sub = tr('kindOne_' + v.kind);
+    if (v.structure >= 0) row(tr('builtBy', colored(playerName(v.player), v.team), clock(v.spawned)));
+    else { row(tr('player', colored(playerName(v.player), v.team))); row(tr('spawnedAt', clock(v.spawned))); }
+    if (v.destroyed) {
+      const by = v.killerSoldier >= 0 ? D.soldiers[v.killerSoldier] : null;
+      row(by ? tr('knockedOutBy', colored(playerName(by.player), by.team), clock(v.destroyed)) : tr('knockedOutAt', clock(v.destroyed)));
+      if (v.weapon >= 0) row(tr('weapon', esc(weaponName(v.weapon))), 'm');
+    } else row(tr('survivedBattle'));
+    if (v.crew.length) row(tr('crew', v.crew.length), 'm');
+    const km = trackLength(v.track) / 1000;
+    if (km >= 0.05) row(tr('distance', km.toFixed(1)), 'm');
+  } else if (sel.type === 'structure') {
+    const s = D.structures[sel.id];
+    sym = markerImg(glyphOfStructure(s.kind), teamColor(s.team), !!s.removed);
+    title = esc(structureName(s));
+    row(tr('builtBy', colored(playerName(s.player), s.team), clock(s.built)));
+    row(s.removed ? tr('destroyedAt', clock(s.removed)) : tr('standsToEnd'), 'm');
+  } else if (sel.type === 'spawn') {
+    const p = SPAWN_POINTS[sel.id], n = pointSpawns(p);
+    sym = markerImg(spawnGlyph(p), teamColor(p.team), p.from === 'rally' && !!p.b, p.from === 'base');
+    title = esc(spawnPointName(p));
+    sub = colored(teamName(p.team), p.team);
+    if (p.from === 'base') row(tr('baseOpen', p.active.map(([a, b]) => tr('timeRange', clock(a), clock(b))).join(', ')), 'm');
+    if (p.from === 'rally') {
+      const s = D.structures[p.ref];
+      row(tr('builtBy', colored(playerName(s.player), s.team), clock(s.built)));
+      row(s.removed ? tr('destroyedAt', clock(s.removed)) : tr('standsToEnd'), 'm');
+    }
+    row(`<b>${tr('squadsHere', n.length)}</b>`);
+    const by = new Map();
+    n.forEach(i => by.set(D.spawns[i].player, (by.get(D.spawns[i].player) || 0) + 1));
+    if (by.size) rows.push(`<ul class="who">${[...by].sort((a, b) => b[1] - a[1]).map(([pl, c]) =>
+      `<li><button class="link" data-player="${pl}">${esc(playerName(pl))}</button><span>${c}</span></li>`).join('')}</ul>`);
+  } else if (sel.type === 'kill') {
+    const k = KILLS[sel.id];
+    sym = k.vehicle != null ? markerImg(vehicleGlyph(D.vehicles[k.vehicle]), teamColor(k.team), true) : markerImg('skull', teamColor(k.team));
+    rows.push(killTip(k));
+  } else if (sel.type === 'down') {
+    sym = markerImg('downed', teamColor(DOWNS[sel.id].team));
+    rows.push(downTip(DOWNS[sel.id]));
+  }
+  card.innerHTML = `<header>${sym}<div class="h">${title ? `<h2>${title}</h2>` : ''}${sub ? `<p class="cardsub">${sub}</p>` : ''}</div>` +
+    `<button class="iconbtn close" title="${tr('close')}">${icon('x')}</button></header><div class="body">${rows.join('')}</div>`;
+  card.hidden = false;
+}
+$('card').addEventListener('click', e => {
+  if (e.target.closest('.close')) return select(null);
+  const pl = e.target.closest('[data-player]');
+  if (pl && +pl.dataset.player >= 0) select({ type: 'player', id: +pl.dataset.player }, true);
+});
 
 // ---------- header
-const killsOf = n => D.players.filter(p => p.team === n).reduce((a, p) => a + stat(p, 'kills'), 0);
 function renderTop() {
   const m = D.meta;
   $('mission').textContent = m.missionName || capital(words(m.mission));
@@ -581,109 +870,128 @@ function renderTop() {
   const mode = [m.modeName || capital(words(m.mode || '')), m.campaignName || capital(words(m.campaign || ''))].filter(Boolean).join(', ');
   const minutes = Math.floor(m.duration / 60), seconds = Math.floor(m.duration % 60);
   $('subtitle').textContent = [mode, date, tr('lasted', tr('minutesSeconds', minutes, seconds))].filter(Boolean).join('. ') + '.';
+  $('result').innerHTML = m.winner
+    ? `<span class="won" style="--c:${teamColor(m.winner)}">${icon('trophy')}${esc(tr('won', teamName(m.winner)))}</span>`
+    : `<span class="won">${esc(tr('noWinner'))}</span>`;
   $('teams').innerHTML = D.teams.map(t => {
-    const k = killsOf(t.number), n = D.players.filter(p => p.team === t.number).length;
+    const k = KILLS.filter(x => x.byTeam === t.number && x.vehicle == null && enemyKill(x)).length, n = D.players.filter(p => p.team === t.number).length;
     return `<div class="teamchip" style="--c:${teamColor(t.number)}"><b>${esc(teamName(t.number))}</b>` +
       `<span>${tr('nPlayers', n)}, ${k} ${tr('killsWord', k)}</span></div>`;
   }).join('');
-  $('modes').innerHTML = MODES.map(([id, ic, key]) =>
-    `<button role="tab" data-mode="${id}" aria-selected="${state.mode === id}">${icon(ic)}${tr(key)}</button>`).join('');
 }
-$('modes').addEventListener('click', e => {
-  const b = e.target.closest('button');
-  if (!b || b.dataset.mode === state.mode) return;
-  state.mode = b.dataset.mode; state.sel = null; state.hot = null; hovered = null;
-  renderTop(); renderPanel(); draw();
-});
 
-// ---------- panel of the mode
-const svgLine = (color, dash = '') => `<svg width="34" height="10" aria-hidden="true"><line x1="2" y1="5" x2="32" y2="5" stroke="rgba(15,17,19,.55)" stroke-width="6" stroke-linecap="round"${dash}/><line x1="2" y1="5" x2="32" y2="5" stroke="${color}" stroke-width="3" stroke-linecap="round"${dash}/></svg>`;
-const svgDot = color => `<svg width="12" height="12" aria-hidden="true"><circle cx="6" cy="6" r="4.2" fill="${color}" stroke="#fff" stroke-width="1.4"/></svg>`;
-const svgZone = () => `<svg width="34" height="20" aria-hidden="true"><rect x="3" y="3" width="28" height="14" rx="3" fill="${P.team[1]}" fill-opacity=".2" stroke="${P.team[1]}" stroke-width="2.5"/></svg>`;
-const img = (name, color) => `<img src="${markerURL(name, color, 40)}" alt="">`;
-const both = fn => D.teams.map(t => fn(teamColor(t.number))).join('');
-const legendItem = (sym, text, note) => `<li><span class="sym">${sym}</span><span>${text}${note ? `<small>${note}</small>` : ''}</span></li>`;
+// ---------- panel
+const LAYERS = [
+  ['heat', null, 'layerHeat', 'layerHeatHint'],
+  ['spawns', 'rally', 'layerSpawns', 'layerSpawnsHint'],
+  ['vehicles', 'tank', 'layerVehicles'],
+  ['deaths', 'skull', 'layerDeaths'],
+  ['downs', 'downed', 'layerDowns'],
+  ['structures', 'wall', 'layerStructures', 'layerStructuresHint'],
+];
+const KINDS = ['tank', 'apc', 'plane', 'bike', 'car', 'gun', 'ship'].filter(k => D.vehicles.some(v => v.kind === k && v.player >= 0));
+function layerCount(id) {
+  switch (id) {
+    case 'deaths': return shownKills().filter(([k]) => k.vehicle == null).length;
+    case 'downs': return shownDowns().length;
+    case 'spawns': return D.spawns.filter(s => inTime(s.t) && ofTeam(s.team) && s.from && s.from !== 'vehicle' && s.from !== 'air').length;
+    case 'vehicles': return shownVehicles().length;
+    case 'structures': return shownStructures().length;
+  }
+  return '';
+}
 
 function renderPanel() {
-  const teamSeg = `<div class="seg" id="teamSeg">` +
-    [[0, tr('bothTeams'), null], ...D.teams.map(t => [t.number, tr('team', t.number), teamColor(t.number)])]
+  $('filters').innerHTML = `<div class="seg" id="teamSeg">` +
+    [[0, tr('bothTeams'), null], ...D.teams.map(t => [t.number, teamName(t.number), teamColor(t.number)])]
       .map(([v, l, c]) => `<button data-v="${v}" aria-pressed="${v === state.team}">${c ? `<i style="--c:${c}"></i>` : ''}${esc(l)}</button>`).join('') + '</div>';
-  const sw = (id, on, text) => `<label class="switchrow"><span>${text}</span><input type="checkbox" class="switch" data-opt="${id}"${on ? ' checked' : ''}></label>`;
-  let intro = '', legend = '', options = '', list = '';
-  const heatLegend = legendItem('<span class="ramp"></span>', tr('legendHeat'), tr('legendHeatNote'));
-  const zoneLegend = legendItem(svgZone(), tr('legendZone'), tr('legendZoneNote')) +
-    (whole() ? '' : legendItem(both(c => svgLine(c, ' stroke-dasharray="7 5"')), tr('legendArea')));
+  renderLayers();
+  renderLists();
+}
 
-  if (state.mode === 'fight') {
-    intro = tr('fightIntro');
-    legend = heatLegend +
-      (state.deaths ? legendItem(both(svgDot), tr('legendDeath')) : '') + zoneLegend;
-    options = sw('skipSpawn', state.skipSpawn, tr('skipSpawn')) + sw('deaths', state.deaths, tr('showDeaths'));
-    list = SECTORS.length ? `<h3>${tr('fightList')}</h3><div class="list">` + SECTORS.map(s => {
-      const lost = t => D.soldiers.filter(x => x.died >= s.a && x.died <= s.b && x.team === t).length;
-      const res = s.taker ? tr('sectorTaken', team(s.taker) && team(s.taker).army ? armyName(team(s.taker)) : s.taker) : tr('sectorHeld');
-      return `<button class="item" data-type="sector" data-id="${s.n}" style="--c:${s.taker ? teamColor(s.taker) : P.muted}"${state.t0 === s.a && state.t1 === s.b ? ' aria-current="true"' : ''}>` +
-        `<span class="ico">${s.n}</span><span class="t">${esc(s.name)}</span><span class="r">${span(s.a, s.b)}</span>` +
-        `<span class="s">${esc(res)}</span><span class="r m">${tr('losses')} ${D.teams.map(t => colored(lost(t.number), t.number)).join(' : ')}</span></button>`;
-    }).join('') + '</div>' : '';
-  } else if (state.mode === 'vehicles') {
-    intro = tr('vehiclesIntro');
-    legend = legendItem(both(c => svgLine(c)), tr('legendRoute')) +
-      legendItem(both(c => img('car', c)), tr('legendCalled')) +
-      legendItem(both(c => img('x', c)), tr('legendKnocked')) + (state.heat ? heatLegend : '') + zoneLegend;
-    options = sw('planes', state.planes, tr('showPlanes')) + sw('heat', state.heat, tr('showHeat'));
-    const vs = D.vehicles.map((v, i) => [v, i]).filter(([v]) => v.player >= 0 && ofTeam(v.team) && (state.planes || v.kind !== 'plane'));
-    list = `<h3>${tr('vehiclesList', vs.length)}</h3>` + (vs.length ? '<div class="list">' + vs.map(([v, i]) =>
-      `<button class="item" data-type="vehicle" data-id="${i}" style="--c:${teamColor(v.team)}"${same(state.sel, { type: 'vehicle', id: i }) ? ' aria-current="true"' : ''}>` +
-      `<span class="ico">${icon(v.kind === 'plane' ? 'plane' : 'car')}</span><span class="t" title="${esc(v.model)}">${esc(vehicleName(v))}</span>` +
-      `<span class="r">${span(v.spawned, v.destroyed)}</span>` +
-      `<span class="s">${esc(playerName(v.player))}</span><span class="r ${v.destroyed ? 'bad' : 'good'}">${v.destroyed ? tr('knockedOut') : tr('survived')}</span></button>`).join('') + '</div>'
-      : `<p class="empty">${tr('noVehicles')}</p>`);
+function renderLayers() {
+  const c = teamColor(state.team || 1);
+  const chips = (set, items, name) => `<div class="chips">${items.map(id =>
+    `<button data-${set}="${id}" aria-pressed="${state[set].has(id)}">${esc(tr(name(id)))}</button>`).join('')}</div>`;
+  $('layers').innerHTML = `<h3>${tr('layers')}</h3>` + LAYERS.map(([id, glyph, name, hint]) => {
+    const on = state.layers[id];
+    const sym = glyph ? markerImg(glyph, c) : '<span class="ramp"></span>';
+    let extra = '';
+    if (on && id === 'heat') extra = `<label class="opt"><input type="checkbox" data-opt="skipSpawn"${state.skipSpawn ? ' checked' : ''}>${tr('skipSpawn')}</label>`;
+    if (on && id === 'deaths') extra = chips('groups', Object.keys(GROUP_NAMES).filter(g => KILLS.some(k => k.group === g && k.vehicle == null)), g => GROUP_NAMES[g]);
+    if (on && id === 'vehicles' && KINDS.length > 1) extra = chips('kinds', KINDS, k => 'kind_' + k);
+    return `<div class="layer${on ? ' on' : ''}"><label title="${hint ? esc(tr(hint)) : ''}"><span class="sym">${sym}</span>` +
+      `<span class="t">${tr(name)}</span><span class="n">${on ? layerCount(id) : ''}</span>` +
+      `<input type="checkbox" class="switch" data-layer="${id}"${on ? ' checked' : ''}></label>${extra}</div>`;
+  }).join('');
+}
+
+function renderLists() {
+  const tabs = [['players', 'listPlayers'], ['vehicles', 'listVehicles'], ['kills', 'listKills']];
+  let body = '';
+  const cur = (type, id) => same(state.sel, { type, id }) ? ' aria-current="true"' : '';
+  if (state.list === 'players') {
+    body = D.teams.map(t => {
+      const ps = D.players.map((p, i) => [p, i]).filter(([p]) => p.team === t.number && ofTeam(p.team)).sort((a, b) => stat(b[0], 'score') - stat(a[0], 'score'));
+      if (!ps.length) return '';
+      return `<div class="sub"><span style="color:${teamColor(t.number)}">${esc(teamName(t.number))}</span><span>${tr('killsDeaths')}</span></div>` + ps.map(([p, i]) => {
+        const kills = KILLS.filter(k => k.byPlayer === i && k.vehicle == null && enemyKill(k) && inTime(k.t)).length;
+        const deaths = KILLS.filter(k => k.player === i && k.vehicle == null && inTime(k.t)).length;
+        return `<button class="row" data-type="player" data-id="${i}"${cur('player', i)}>` +
+          `<span class="t${p.bot ? ' m' : ''}">${esc(p.name)}</span>${p.platoon ? `<span class="pl" title="${esc(tr('platoon', p.platoon))}">${esc(p.platoon)}</span>` : ''}` +
+          `<span class="r num">${kills} / ${deaths}</span></button>`;
+      }).join('');
+    }).join('');
+  } else if (state.list === 'vehicles') {
+    const vs = D.vehicles.map((v, i) => [v, i]).filter(([v]) => v.player >= 0 && ofTeam(v.team) && overlaps(v.spawned, v.destroyed));
+    body = vs.length ? vs.map(([v, i]) =>
+      `<button class="row" data-type="vehicle" data-id="${i}"${cur('vehicle', i)}>${markerImg(vehicleGlyph(v), teamColor(v.team), !!v.destroyed)}` +
+      `<span class="t">${esc(vehicleName(v))}<small>${esc(playerName(v.player))}</small></span>` +
+      `<span class="r ${v.destroyed ? 'bad' : 'good'}">${clock(v.spawned)}<small>${v.destroyed ? tr('knockedOut') : tr('survived')}</small></span></button>`).join('')
+      : `<p class="empty">${tr('noVehicles')}</p>`;
   } else {
-    intro = tr('structuresIntro');
-    legend = legendItem(both(c => img('tent', c)), tr('legendRally')) +
-      (state.other ? legendItem(both(c => img('hammer', c)), tr('legendOther')) : '') + (state.heat ? heatLegend : '') + zoneLegend;
-    options = sw('other', state.other, tr('showOther')) + sw('heat', state.heat, tr('showHeat'));
-    const ss = shownStructures();
-    list = `<h3>${tr(whole() ? 'structuresList' : 'structuresListPart', ss.length)}</h3>` + (ss.length ? '<div class="list">' + ss.map(([s, i]) =>
-      `<button class="item" data-type="structure" data-id="${i}" style="--c:${teamColor(s.team)}"${same(state.sel, { type: 'structure', id: i }) ? ' aria-current="true"' : ''}>` +
-      `<span class="ico">${icon(s.rally ? 'tent' : 'hammer')}</span><span class="t">${esc(s.rally ? tr('rallyPoint') : structureName(s))}</span>` +
-      `<span class="r">${span(s.built, s.removed)}</span>` +
-      `<span class="s">${esc(playerName(s.player))}</span><span class="r ${s.removed ? 'bad' : 'good'}">${s.removed ? tr('destroyed') : tr('standing')}</span></button>`).join('') + '</div>'
-      : `<p class="empty">${tr('noStructures')}</p>`);
+    const LIMIT = 300;
+    const ks = KILLS.map((k, i) => [k, i]).filter(([k]) => inTime(k.t) && (ofTeam(k.team) || ofTeam(k.byTeam)) && (!REL || REL.kills.has(KILLS.indexOf(k)) || state.sel.type === 'kill'));
+    body = ks.length ? ks.slice(0, LIMIT).map(([k, i]) => {
+      const victim = k.vehicle != null ? vehicleName(D.vehicles[k.vehicle]) : playerName(k.player);
+      return `<button class="row kill" data-type="kill" data-id="${i}"${cur('kill', i)}><span class="r num m">${clock(k.t)}</span>` +
+        `<span class="t">${k.by >= 0 && k.by !== k.soldier ? colored(playerName(k.byPlayer), k.byTeam) + ' → ' : ''}${colored(victim, k.team)}` +
+        `<small>${esc(weaponName(k.weapon))}${k.headshot ? ` · ${tr('headshot')}` : ''}</small></span></button>`;
+    }).join('') + (ks.length > LIMIT ? `<p class="empty">${tr('moreKills', ks.length - LIMIT)}</p>` : '')
+      : `<p class="empty">${tr('noKills')}</p>`;
   }
-  const title = MODES.find(m => m[0] === state.mode)[2];
-  $('panel').innerHTML = `<div class="block"><h2>${tr(title)}</h2><p class="lead">${intro}</p></div>` +
-    `<div class="block">${teamSeg}${options}</div>` +
-    `<div class="block"><h3>${tr('legend')}</h3><ul class="legend">${legend}</ul></div>` +
-    (list ? `<div class="block">${list}</div>` : '');
+  $('lists').innerHTML = `<div class="seg small" id="listSeg">${tabs.map(([id, key]) =>
+    `<button data-list="${id}" aria-pressed="${state.list === id}">${tr(key)}</button>`).join('')}</div><div class="list">${body}</div>`;
+  const row = state.sel && $('lists').querySelector('[aria-current="true"]');
+  if (row) row.scrollIntoView({ block: 'nearest' });
 }
 
 $('panel').addEventListener('click', e => {
   const seg = e.target.closest('#teamSeg button');
-  if (seg) { state.team = +seg.dataset.v; state.sel = null; renderPanel(); draw(); return; }
-  const row = e.target.closest('[data-type]');
-  if (!row) return;
-  if (row.dataset.type === 'sector') {
-    const s = SECTORS[+row.dataset.id - 1];
-    if (state.t0 === s.a && state.t1 === s.b) setRange(0, END);
-    else { setRange(s.a, s.b); fitPoints(s.zones.map(z => z.pos), 300); }
-    return;
+  if (seg) { state.team = +seg.dataset.v; renderPanel(); renderTop(); draw(); return; }
+  const list = e.target.closest('[data-list]');
+  if (list) { state.list = list.dataset.list; renderLists(); return; }
+  const g = e.target.closest('[data-groups], [data-kinds]');
+  if (g) {
+    const [set, id] = g.dataset.groups ? ['groups', g.dataset.groups] : ['kinds', g.dataset.kinds];
+    state[set].has(id) ? state[set].delete(id) : state[set].add(id);
+    renderLayers(); draw(); return;
   }
-  select({ type: row.dataset.type, id: +row.dataset.id }, true);
+  const row = e.target.closest('[data-type]');
+  if (row) select({ type: row.dataset.type, id: +row.dataset.id }, true);
 });
 $('panel').addEventListener('change', e => {
-  const opt = e.target.dataset.opt;
-  if (!opt) return;
-  state[opt] = e.target.checked;
-  renderPanel(); draw();
+  const layer = e.target.dataset.layer, opt = e.target.dataset.opt;
+  if (layer) state.layers[layer] = e.target.checked;
+  else if (opt) state[opt] = e.target.checked;
+  else return;
+  renderLayers(); draw();
 });
 $('panel').addEventListener('mouseover', e => {
-  const row = e.target.closest('[data-type="vehicle"], [data-type="structure"]');
-  const obj = row ? { type: row.dataset.type, id: +row.dataset.id } : null;
+  const row = e.target.closest('[data-type="vehicle"]');
+  const obj = row ? { type: 'vehicle', id: +row.dataset.id } : null;
   if (!same(obj, state.hot) && (obj || state.hot)) { state.hot = obj; draw(); }
 });
-$('panel').addEventListener('mouseleave', () => { if (state.hot) { state.hot = null; draw(); } });
 
 // ---------- battle course
 // The sectors of the battle as a row of stages, the kills of each team in 10-second
@@ -692,16 +1000,12 @@ $('panel').addEventListener('mouseleave', () => { if (state.hot) { state.hot = n
 const timeline = (() => {
   const tc = $('timeline'), g = tc.getContext('2d');
   tc.title = tr(SECTORS.length ? 'stripHint' : 'stripHintNoSectors');
-  const BUCKET = 10, LEFT = 14, RIGHT = 14, SECT = 30, KILLS = 40, AXIS = 22;
+  const BUCKET = 10, LEFT = 14, RIGHT = 14, SECT = 30, KILLS_H = 40, AXIS = 22;
   const n = Math.max(1, Math.ceil(END / BUCKET));
   const kills = { 1: new Array(n).fill(0), 2: new Array(n).fill(0) };
-  for (const s of D.soldiers) {
-    if (!s.died || s.killer < 0) continue;
-    const kt = D.players[s.killer].team;
-    if (kills[kt] && kt !== s.team) kills[kt][Math.min(n - 1, Math.floor(s.died / BUCKET))]++;
-  }
+  for (const k of KILLS) if (k.vehicle == null && enemyKill(k) && kills[k.byTeam]) kills[k.byTeam][Math.min(n - 1, Math.floor(k.t / BUCKET))]++;
   const peak = Math.max(1, ...kills[1], ...kills[2]);
-  const top = SECTORS.length ? SECT + 8 : 0, height = 6 + top + KILLS + AXIS;
+  const top = SECTORS.length ? SECT + 8 : 0, height = 6 + top + KILLS_H + AXIS;
 
   let w = 0, dragFrom = null, cursor = null;
   const xOf = t => LEFT + t / END * (w - LEFT - RIGHT);
@@ -719,7 +1023,6 @@ const timeline = (() => {
     const inSel = (a, b) => b > state.t0 && a < state.t1;
     g.textBaseline = 'middle';
 
-    // sectors
     for (const s of SECTORS) {
       const x0 = xOf(s.a) + 1, x1 = xOf(s.b) - 1, c = s.taker ? teamColor(s.taker) : P.muted, chosen = state.t0 === s.a && state.t1 === s.b;
       g.globalAlpha = whole() || inSel(s.a, s.b) ? 1 : 0.35;
@@ -735,8 +1038,7 @@ const timeline = (() => {
       g.globalAlpha = 1;
     }
 
-    // kills
-    const kt = 6 + top, mid = kt + KILLS / 2, amp = KILLS / 2 - 2, bw = Math.max(1, (w - LEFT - RIGHT) / n - 1);
+    const kt = 6 + top, mid = kt + KILLS_H / 2, amp = KILLS_H / 2 - 2, bw = Math.max(1, (w - LEFT - RIGHT) / n - 1);
     for (const tm of [1, 2]) {
       g.fillStyle = teamColor(tm);
       kills[tm].forEach((k, i) => {
@@ -749,7 +1051,6 @@ const timeline = (() => {
     g.globalAlpha = 1;
     g.fillStyle = P.line; g.fillRect(LEFT, mid, w - LEFT - RIGHT, 1);
 
-    // axis
     const ay = height - AXIS / 2;
     const stepMin = [1, 2, 5, 10].find(m => (w - LEFT - RIGHT) / (END / 60 / m) >= 46) || 15;
     g.font = `12px ${P.body}`; g.fillStyle = P.muted;
@@ -761,14 +1062,14 @@ const timeline = (() => {
     if (!whole()) {
       const x0 = xOf(state.t0), x1 = xOf(state.t1);
       g.fillStyle = P.dark ? 'rgba(255,255,255,.08)' : 'rgba(28,34,40,.07)';
-      g.fillRect(x0, kt - 2, x1 - x0, KILLS + 4);
-      g.fillStyle = P.text; g.fillRect(x0 - 1, kt - 2, 2, KILLS + 4); g.fillRect(x1 - 1, kt - 2, 2, KILLS + 4);
+      g.fillRect(x0, kt - 2, x1 - x0, KILLS_H + 4);
+      g.fillStyle = P.text; g.fillRect(x0 - 1, kt - 2, 2, KILLS_H + 4); g.fillRect(x1 - 1, kt - 2, 2, KILLS_H + 4);
     }
     if (cursor != null) {
       const x = xOf(cursor), label = clock(cursor);
       g.font = `12px ${P.body}`;
       const lw = g.measureText(label).width + 10, lx = Math.min(Math.max(x - lw / 2, 2), w - lw - 2);
-      g.fillStyle = P.text; g.globalAlpha = 0.5; g.fillRect(x, kt - 2, 1, KILLS + 4); g.globalAlpha = 1;
+      g.fillStyle = P.text; g.globalAlpha = 0.5; g.fillRect(x, kt - 2, 1, KILLS_H + 4); g.globalAlpha = 1;
       g.beginPath(); g.roundRect(lx, height - AXIS + 2, lw, 17, 4); g.fill();
       g.fillStyle = P.panel; g.textAlign = 'left'; g.fillText(label, lx + 5, height - AXIS / 2 + 1);
     }
@@ -803,7 +1104,7 @@ function setRange(a, b) {
       `<button class="link" id="rangeReset">${tr('showWhole')}</button>`;
   const reset = $('rangeReset');
   if (reset) reset.onclick = () => setRange(0, END);
-  if (ready) renderPanel();
+  if (ready) { renderLayers(); renderLists(); renderCard(); }
   draw();
 }
 
@@ -821,6 +1122,7 @@ function resize() {
   const first = !W;
   W = r.width; H = r.height;
   cv.width = W * DPR; cv.height = H * DPR;
+  sprites.clear();
   if (first) fitBattle();
   draw();
 }

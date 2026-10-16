@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,9 +11,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/enlisted-stats/erpl-cli/internal/gamedata"
 	"github.com/enlisted-stats/erpl-cli/internal/home"
-	"github.com/enlisted-stats/erpl-cli/internal/maps"
-	"github.com/enlisted-stats/erpl-cli/internal/names"
 	"github.com/enlisted-stats/erpl-cli/internal/report"
 	"github.com/enlisted-stats/erpl-cli/internal/ui"
 )
@@ -28,7 +25,7 @@ func reportCommand() *cobra.Command {
 		Short: "Make an HTML page about a battle with an interactive map, and open it",
 		Long: "Make an HTML page about a battle with an interactive map, and open it.\n\n" +
 			"The page goes to the reports folder next to erpl. It is a single file that opens without the internet, " +
-			"so it can be sent to others. The map images come from the maps folder made by erpl-mapgen.",
+			"so it can be sent to others.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !slices.Contains(report.Languages, lang) {
@@ -42,11 +39,7 @@ func reportCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ix, err := maps.Load(d.Data())
-			if err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return err
-			}
-			n, err := names.Load(d.Data(), lang)
+			gd, err := gamedata.Load()
 			if err != nil {
 				return err
 			}
@@ -63,7 +56,7 @@ func reportCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := report.Write(f, lang, filepath.Base(rp.Path), m, b, n, ix, d.Maps()); err != nil {
+			if err := report.Write(f, lang, filepath.Base(rp.Path), m, b, gd); err != nil {
 				f.Close()
 				return err
 			}
@@ -74,8 +67,8 @@ func reportCommand() *cobra.Command {
 			w := ui.NewOut(cmd.OutOrStdout())
 			fmt.Fprint(w, header(rp.Index, rp.Path))
 			fmt.Fprintln(w, "Report: "+ui.Accent.Render(path))
-			if mp, ok := ix.Missions[m.Mission]; !ok || ix.Maps[mp.Map].Image == "" {
-				fmt.Fprintln(w, ui.Muted.Render("No map image for "+m.Mission+": run erpl-mapgen to add the maps."))
+			if gd.Maps[gd.Missions[m.Mission].Map].Image == "" {
+				fmt.Fprintln(w, ui.Muted.Render("The game has no map image for "+m.Mission+": the page draws the battle on a grid."))
 			}
 			if !noOpen {
 				return openFile(path)

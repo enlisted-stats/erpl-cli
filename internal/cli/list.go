@@ -34,34 +34,52 @@ func listCommand() *cobra.Command {
 			first := max(last-pageSize, 0)
 
 			var rows [][]string
-			failed := map[int]bool{}
+			failed, other := map[int]bool{}, map[int]bool{}
 			for i := last - 1; i >= first; i-- {
 				rp := rs[i]
 				num := strconv.Itoa(rp.Index)
 				r, err := erpl.Open(rp.Path)
 				if err != nil {
 					failed[len(rows)] = true
-					rows = append(rows, []string{num, "-", filepath.Base(rp.Path), err.Error(), "", "", ""})
+					rows = append(rows, []string{num, "-", filepath.Base(rp.Path), err.Error(), "", "", "", ""})
 					continue
 				}
 				m := r.Meta()
+				game := ""
+				if m.ExeVersion != erpl.GameVersion {
+					other[len(rows)] = true
+					game = m.ExeVersion
+				}
 				rows = append(rows, []string{
 					num, ui.Date(m.StartTime), m.Mission, m.MissionType, m.Campaign,
-					ui.Clock(m.Duration), strconv.Itoa(len(m.Players)),
+					ui.Clock(m.Duration), strconv.Itoa(len(m.Players)), game,
 				})
 			}
 
 			cols := []ui.Column{
 				{Title: "#", Right: true}, {Title: "Date"}, {Title: "Mission", Cut: true}, {Title: "Mode"},
 				{Title: "Campaign", Cut: true}, {Title: "Length", Right: true}, {Title: "Players", Right: true},
+				{Title: "Other game"},
+			}
+			if len(other) == 0 {
+				cols = cols[:len(cols)-1]
+				for i := range rows {
+					rows[i] = rows[i][:len(cols)]
+				}
 			}
 			w := ui.NewOut(cmd.OutOrStdout())
 			fmt.Fprintln(w, w.Table(cols, rows, func(i int) lipgloss.Style {
-				if failed[i] {
+				switch {
+				case failed[i]:
 					return ui.Bad
+				case other[i]:
+					return ui.Muted
 				}
 				return lipgloss.NewStyle()
 			}))
+			if len(other) > 0 {
+				fmt.Fprintln(w, ui.Muted.Render("erpl reads only replays of game "+erpl.GameVersion+", the grey ones are of other versions"))
+			}
 			footer := fmt.Sprintf("page %d of %d · %d replays", page, pages, len(rs))
 			if page < pages {
 				footer += fmt.Sprintf(" · older: erpl list -p %d", page+1)

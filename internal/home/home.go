@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 )
 
-// Dir is the program folder that holds the replays, reports and maps folders.
+// Dir is the program folder that holds the replays and reports folders.
 type Dir string
 
 // Find returns the folder of the executable, or the working directory if only it
@@ -25,11 +25,6 @@ func Find() (Dir, error) {
 }
 
 func (d Dir) Replays() string { return filepath.Join(string(d), "replays") }
-
-func (d Dir) Maps() string { return filepath.Join(string(d), "maps") }
-
-// Data is the folder of the JSON files erpl-mapgen makes: the map index and the names.
-func (d Dir) Data() string { return filepath.Join(string(d), "data") }
 
 func (d Dir) Reports() string { return filepath.Join(string(d), "reports") }
 
